@@ -87,6 +87,33 @@ def test_adam_training(config):
             torch.testing.assert_close(state[key], value, msg=key)
 
 
+def test_from_seeds_ignores_pack():
+    before = torch.random.get_rng_state()
+    packed = PackedEEGNet.from_seeds([3, 5], C, N_OUT, T)
+    assert torch.equal(torch.random.get_rng_state(), before)
+    alone = PackedEEGNet.from_seeds([5], C, N_OUT, T)
+    for key, value in alone.member_state_dict(0).items():
+        torch.testing.assert_close(packed.member_state_dict(1)[key], value, rtol=0, atol=0, msg=key)
+
+
+def test_member_state_dict():
+    """Loading one member's state changes that member only, outputs included."""
+    packed = PackedEEGNet.from_seeds([0, 1, 2], C, N_OUT, T).double()
+    source = PackedEEGNet.from_seeds([7], C, N_OUT, T).double()
+    with torch.no_grad():
+        for bn in (source.bn_temporal, source.bn1, source.bn2):
+            bn.running_mean.normal_(0, 0.1)
+    before = packed.to_state_dicts()
+    packed.load_member_state_dict(1, source.member_state_dict(0))
+    after = packed.to_state_dicts()
+    for key in before[0]:
+        torch.testing.assert_close(after[0][key], before[0][key], rtol=0, atol=0)
+        torch.testing.assert_close(after[2][key], before[2][key], rtol=0, atol=0)
+        torch.testing.assert_close(after[1][key], source.member_state_dict(0)[key], rtol=0, atol=0)
+    x, _ = inputs()
+    torch.testing.assert_close(packed.eval()(x)[:, 1], source.eval()(x[:, 1:2])[:, 0])
+
+
 def test_roundtrip_through_braindecode():
     packed = PackedEEGNet(K, C, N_OUT, T).double()
     again = PackedEEGNet.from_braindecode(packed.to_braindecode())

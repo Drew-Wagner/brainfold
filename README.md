@@ -16,7 +16,7 @@ pip install "packed-eegnet @ git+https://github.com/Drew-Wagner/packed-eegnet"
 ```
 
 The package depends only on PyTorch. Extras: `[braindecode]` (braindecode >= 1.2)
-for converting to and from braindecode `EEGNet`s, `[recipes]` for the training recipes.
+for `to_braindecode()` and `from_braindecode()`, `[recipes]` for the recipes.
 
 For development:
 
@@ -31,35 +31,45 @@ uv run pytest
 defaults and meaning, after the pack size: `PackedEEGNet(K, **kwargs)` is K
 `EEGNet(**kwargs)`. That includes `chs_info`, `sfreq` and
 `input_window_seconds` for inferring `n_chans` and `n_times`.
+`PackedEEGNet.from_seeds(seeds, ...)` initializes member k from `seeds[k]`
+alone, so a member's initial weights don't depend on what it is packed with.
 
 ```python
-from packed_eegnet import fit, predict, seeded_packed_eegnet
+import torch
+import torch.nn.functional as F
+from packed_eegnet import PackedEEGNet
 
-# X: (n_trials, n_chans, n_times), y: (n_trials,), shared by all runs.
-# train_idx: (K, n_train), test_idx: (K, n_test), one row of trial indices per run.
-model = seeded_packed_eegnet(seeds, n_chans=22, n_outputs=4, n_times=513)  # member k from seeds[k]
-fit(model.cuda(), X, y, train_idx, seeds, epochs=300)
-preds = predict(model, X, test_idx)  # (n_test, K)
+model = PackedEEGNet.from_seeds(seeds, n_chans=22, n_outputs=4, n_times=512).cuda()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+for x, y in batches:  # x: (batch, K, n_chans, n_times), y: (batch, K); column k is member k's batch
+    logits = model(x)  # (batch, K, n_outputs)
+    losses = F.cross_entropy(logits.permute(0, 2, 1), y, reduction="none").mean(0)  # (K,)
+    optimizer.zero_grad()
+    losses.sum().backward()  # SUM, not mean: each member gets exactly its own gradient
+    optimizer.step()         # one Adam over the packed parameters == K separate Adams
 ```
 
-`fit` is a plain Adam + cosine-schedule loop. To write your own, the pieces are:
+Any optimizer that updates each parameter element on its own (SGD, Adam,
+AdamW) treats the members independently. The recipe below has a complete
+loop: per-member shuffling, a cosine schedule, evaluation and a baseline.
+
+**Per-member state.** `member_state_dict(k)` returns member k's weights and
+BatchNorm statistics, and `load_member_state_dict(k, state)` overwrites member k
+alone. For example, per-member early stopping:
 
 ```python
-logits = model(x)                 # x: (batch, K, n_chans, n_times) -> (batch, K, n_outputs)
-loss = packed_loss(logits, y)     # y: (batch, K); SUM of member mean losses
-loss.backward()                   # so each member gets exactly its own gradient
-optimizer.step()                  # one Adam over all parameters == K separate Adams
+for k in range(K):
+    if val_acc[k] > best_acc[k]:
+        best_acc[k], best_state[k] = val_acc[k], model.member_state_dict(k)
+...
+model.load_state_dicts(best_state)  # every member at its own best epoch
 ```
 
-`packed_batches(train_idx, batch_size, generators)` yields `(batch, K)` index
-tensors with a separate shuffle per member.
-
-To use braindecode for everything after training (evaluation, saving, the
-Hugging Face Hub), convert the pack: `model.to_braindecode()` returns K
-ordinary `EEGNet`s, and `PackedEEGNet.from_braindecode(models)` packs existing
-ones. `to_state_dicts()` and `load_state_dicts()` do the same with state dicts.
-`PackOfOne(eegnet)` gives a single braindecode model the packed interface, so
-`fit` and `predict` can train it alone as a baseline.
+**braindecode.** The state dicts use braindecode `EEGNet`'s format.
+`model.to_braindecode()` returns K ordinary `EEGNet`s for everything after
+training (evaluation, saving, the Hugging Face Hub), and
+`PackedEEGNet.from_braindecode(models)` packs existing ones.
 
 ## Recipes
 
@@ -94,22 +104,43 @@ seeds 0, 1, 2 (54 runs) on an RTX 4080 SUPER, training and evaluation:
 
 Seconds of training per model per epoch, batch 64, on an RTX 4080 SUPER
 (`benchmarks/bench_packing.py`). The baseline trains one braindecode `EEGNet`
-at a time.
+at a time; "torch.func" is PyTorch's ensembling recipe over 18 braindecode
+`EEGNet`s (see below).
 
-| training set | EEGNet | braindecode | K=4 | K=9 | K=18 | K=36 |
-|---|---|---|---|---|---|---|
-| 4608 trials (leave-one-subject-out) | F1=4, D=2 | 0.110 | 0.068 | 0.028 | **0.017 (6.3x)** | 0.018 |
-| | F1=8, D=2 | 0.119 | 0.063 | 0.029 | **0.028 (4.3x)** | 0.029 |
-| 288 trials (leave-one-session-out) | F1=4, D=2 | 0.0080 | 0.0041 | 0.0019 | **0.0011 (7.6x)** | 0.0011 |
-| | F1=8, D=2 | 0.0075 | 0.0042 | 0.0019 | **0.0017 (4.4x)** | 0.0018 |
+| training set | EEGNet | braindecode | torch.func, K=18 | packed, K=4 | K=9 | K=18 | K=36 |
+|---|---|---|---|---|---|---|---|
+| 4608 trials (leave-one-subject-out) | F1=4, D=2 | 0.111 | 0.091 (1.2x) | 0.062 | 0.028 | **0.017 (6.7x)** | 0.017 |
+| | F1=8, D=2 | 0.115 | 0.190 (0.6x) | 0.062 | 0.028 | **0.027 (4.3x)** | 0.028 |
+| 288 trials (leave-one-session-out) | F1=4, D=2 | 0.0075 | 0.0057 (1.3x) | 0.0044 | 0.0020 | **0.0011 (7.1x)** | 0.0011 |
+| | F1=8, D=2 | 0.0076 | 0.0119 (0.6x) | 0.0044 | 0.0020 | **0.0017 (4.5x)** | 0.0017 |
 
 Throughput stops improving at about K=18. With K=1, `PackedEEGNet` is about
 2x *slower* than braindecode's `EEGNet`; the gain appears from about K=4.
 
-**Why packing alone isn't enough:** EEGNet's first block (temporal conv over every
-electrode at full time resolution, BatchNorm, spatial conv) does real work, and
-that work grows with K. Only the later, tiny layers are launch-bound and pack
-for free. Most of the speedup comes from reordering the first block.
+## Why not PyTorch's ensembling recipe?
+
+The standard way to train K copies of a model at once is `torch.func`:
+`stack_module_state` on K models, then `vmap` over `functional_call`. On
+braindecode's `EEGNet` it is exact: forward passes and BatchNorm running
+statistics match K separate models in float64. It just isn't fast here (table
+above): 1.2x with F1=4, and *slower* than one model at a time with F1=8.
+
+- **It batches the computation as written.** EEGNet's first block filters every
+  electrode at full time resolution before mixing electrodes, and that work
+  grows with K. `vmap` can only run it K times in parallel. `PackedEEGNet`
+  mixes electrodes first (below), which does about 11x less work in that block.
+- **Batched convolutions become grouped convolutions.** On CUDA these run in
+  PyTorch's generic depthwise kernel (`conv_depthwise2d`), not cuDNN. In a
+  profile of one K=18 training step, those kernels take more than half of the
+  GPU time.
+- braindecode's max-norm constraint uses `renorm`, which has no `vmap`
+  batching rule and falls back to a loop over members (PyTorch warns about
+  it). Replacing it with an equivalent batchable expression did not change
+  the timing measurably, so it isn't the bottleneck.
+
+Most of `PackedEEGNet`'s speedup comes from the reordered first block. Packing
+the later layers, which are small and launch-bound, into grouped convolutions
+does the rest.
 
 ## How it works
 
@@ -152,6 +183,9 @@ BatchNorm, and the running statistics are updated the same way.
   composition, not per run.
 - **Packed runs need equal training-set sizes:** every step draws one batch per
   member. Subsample to equal sizes or group runs by size.
+- **Anything computed over all parameters at once couples the members.** For
+  example, `clip_grad_norm_(model.parameters(), ...)` uses one norm for the
+  whole pack. Clip per member instead, or not at all.
 - **Float32 variance:** `var = E[u^2] - mu^2` can lose precision when the
   temporal-filter output has a large mean relative to its spread. On roughly
   standardized inputs it matches braindecode to about 1e-4 in float32 (tested),

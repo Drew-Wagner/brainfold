@@ -233,26 +233,59 @@ class PackedEEGNet(nn.Module):
     def _batch_norms(self):
         return ("bnorm_temporal", self.bn_temporal), ("bnorm_1", self.bn1), ("bnorm_2", self.bn2)
 
+    def member_state_dict(self, k: int) -> dict[str, Tensor]:
+        """Member k's weights and BatchNorm statistics as a braindecode ``EEGNet`` state dict (a copy).
+
+        Use it to keep a member's best epoch, e.g. for per-member early stopping.
+        """
+        state = {}
+        for key, tensor, shape in self._layout():
+            state[key] = tensor.detach().chunk(self.n_models)[k].reshape(shape).clone()
+        for prefix, bn in self._batch_norms():  # shared by the pack
+            state[f"{prefix}.num_batches_tracked"] = bn.num_batches_tracked.clone()
+        return state
+
+    @torch.no_grad()
+    def load_member_state_dict(self, k: int, state: dict[str, Tensor]) -> None:
+        """Overwrite member k with a braindecode ``EEGNet`` state dict; the other members are untouched.
+
+        ``num_batches_tracked`` is shared by the pack and is not loaded.
+        """
+        for key, tensor, _ in self._layout():
+            chunk = tensor.chunk(self.n_models)[k]
+            chunk.copy_(state[key].reshape(chunk.shape))
+
     def to_state_dicts(self) -> list[dict[str, Tensor]]:
         """K state dicts in braindecode ``EEGNet`` format."""
-        states = [{} for _ in range(self.n_models)]
-        for key, tensor, shape in self._layout():
-            for k, chunk in enumerate(tensor.detach().chunk(self.n_models)):
-                states[k][key] = chunk.reshape(shape).clone()
-        for prefix, bn in self._batch_norms():
-            for state in states:
-                state[f"{prefix}.num_batches_tracked"] = bn.num_batches_tracked.clone()
-        return states
+        return [self.member_state_dict(k) for k in range(self.n_models)]
 
     @torch.no_grad()
     def load_state_dicts(self, states: list[dict[str, Tensor]]) -> None:
         """Load K braindecode ``EEGNet`` state dicts (num_batches_tracked from the first)."""
-        assert len(states) == self.n_models
-        for key, tensor, _ in self._layout():
-            tensor.copy_(torch.cat([state[key].reshape(len(tensor) // self.n_models, *tensor.shape[1:])
-                                    for state in states]))
+        if len(states) != self.n_models:
+            raise ValueError(f"expected {self.n_models} state dicts, got {len(states)}")
+        for k, state in enumerate(states):
+            self.load_member_state_dict(k, state)
         for prefix, bn in self._batch_norms():
             bn.num_batches_tracked.copy_(states[0][f"{prefix}.num_batches_tracked"])
+
+    @classmethod
+    def from_seeds(cls, seeds, *args, **kwargs) -> PackedEEGNet:
+        """A pack whose member k is initialized from ``seeds[k]`` alone.
+
+        Member k's initial weights do not depend on the rest of the pack:
+        ``PackedEEGNet.from_seeds(seeds, ...)`` member k equals
+        ``PackedEEGNet.from_seeds([seeds[k]], ...)``. Arguments after ``seeds`` are
+        ``PackedEEGNet``'s, without ``n_models``. The global RNG state is unchanged.
+        """
+        states = []
+        with torch.random.fork_rng(devices=[]):
+            for seed in seeds:
+                torch.manual_seed(seed)
+                states.append(cls(1, *args, **kwargs).member_state_dict(0))
+            packed = cls(len(seeds), *args, **kwargs)
+        packed.load_state_dicts(states)
+        return packed
 
     @classmethod
     def from_braindecode(cls, models) -> PackedEEGNet:

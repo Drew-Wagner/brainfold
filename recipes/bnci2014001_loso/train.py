@@ -14,6 +14,7 @@ Hyperparameters come from hparams.yaml; override any of them with --set.
 from __future__ import annotations
 
 import argparse
+import math
 import time
 import warnings
 from pathlib import Path
@@ -21,6 +22,7 @@ from pathlib import Path
 import mne
 import numpy as np
 import torch
+import torch.nn.functional as F
 import yaml
 from braindecode.datasets import MOABBDataset
 from braindecode.preprocessing import (
@@ -31,7 +33,7 @@ from braindecode.preprocessing import (
 )
 from sklearn.metrics import cohen_kappa_score
 
-from packed_eegnet import PackOfOne, fit, predict, seeded_packed_eegnet
+from packed_eegnet import PackedEEGNet
 
 warnings.filterwarnings("ignore", message=".*final_layer_with_constraint.*")
 mne.set_log_level("WARNING")
@@ -57,6 +59,49 @@ def load_data(subjects, sfreq, l_freq, h_freq, factor_new, init_block_size):
         subject += [recording.description["subject"]] * len(recording)
         session += [recording.description["session"]] * len(recording)
     return np.stack(X).astype(np.float32), np.array(y), np.array(subject), np.array(session)
+
+
+def fit(model, X, y, train_idx, seeds, epochs, lr, batch_size):
+    """Train every member with Adam and a cosine learning-rate schedule.
+
+    ``model`` maps (batch, K, n_chans, n_times) to (batch, K, n_outputs). Member k
+    trains on ``X[train_idx[k]]`` (equal sizes required), shuffled by ``seeds[k]`` alone.
+    """
+    generators = [torch.Generator(device=train_idx.device).manual_seed(seed) for seed in seeds]
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    n_train = train_idx.shape[1]
+    for epoch in range(epochs):
+        for group in optimizer.param_groups:
+            group["lr"] = 0.5 * lr * (1 + math.cos(math.pi * epoch / epochs))
+        model.train()
+        order = torch.stack([torch.randperm(n_train, device=train_idx.device, generator=g) for g in generators])
+        for i in range(0, n_train, batch_size):
+            idx = train_idx.gather(1, order[:, i : i + batch_size]).T  # (batch, K)
+            losses = F.cross_entropy(model(X[idx]).permute(0, 2, 1), y[idx], reduction="none").mean(0)
+            optimizer.zero_grad(set_to_none=True)
+            # SUM of the member mean losses: each member gets exactly its own gradient,
+            # and one Adam over the packed parameters == K separate Adams.
+            losses.sum().backward()
+            optimizer.step()
+    return model
+
+
+@torch.no_grad()
+def predict(model, X, idx, batch_size=64):
+    """(n, K) predicted classes; column k is member k's prediction for ``X[idx[k]]``."""
+    model.eval()
+    return torch.cat([model(X[idx[:, i : i + batch_size].T]).argmax(-1) for i in range(0, idx.shape[1], batch_size)])
+
+
+class PackOfOne(torch.nn.Module):
+    """A single braindecode EEGNet with the packed (batch, 1, ...) interface, for the baseline."""
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, x):
+        return self.model(x[:, 0])[:, None]
 
 
 def folds(subjects, sessions):
@@ -113,7 +158,7 @@ def main():
         train_idx = torch.stack([idx for _, _, idx, _ in pack]).to(args.device)  # equal sizes required
         test_idx = torch.stack([idx for _, _, _, idx in pack]).to(args.device)
         labels = y[test_idx.T].cpu()
-        model = seeded_packed_eegnet(seeds, X.shape[1], n_classes, X.shape[2], **hp["model"]).to(args.device)
+        model = PackedEEGNet.from_seeds(seeds, X.shape[1], n_classes, X.shape[2], **hp["model"]).to(args.device)
         eegnets = model.to_braindecode() if args.baseline else []  # copies of the initial weights
 
         t0 = time.perf_counter()
