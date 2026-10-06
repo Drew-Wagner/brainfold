@@ -50,9 +50,10 @@ for x, y in batches:  # x: (batch, K, n_chans, n_times), y: (batch, K); column k
     optimizer.step()         # one Adam over the packed parameters == K separate Adams
 ```
 
-Any optimizer that updates each parameter element on its own (SGD, Adam,
-AdamW) treats the members independently. The recipe below has a complete
-loop: per-member shuffling, a cosine schedule, evaluation and a baseline.
+Not every training trick keeps the members independent: see
+[Keeping members independent](#keeping-members-independent). The recipe below
+has a complete loop: per-member shuffling, a cosine schedule, evaluation and a
+baseline.
 
 **Per-member state.** `member_state_dict(k)` returns member k's weights and
 BatchNorm statistics, and `load_member_state_dict(k, state)` overwrites member k
@@ -175,6 +176,58 @@ Gram matrices of the edge samples. Neither needs gradients. Gradients reach
 w, gamma, beta and s through `mu_f` and `var_f` exactly as through the original
 BatchNorm, and the running statistics are updated the same way.
 
+## Keeping members independent
+
+A packed model is one `nn.Module` whose parameters hold all K members side by
+side. Each member trains exactly as it would alone only if **every operation
+in the training loop is separable across members**: it acts on each parameter
+element on its own, or it is a sum of per-member terms. Anything that computes
+one statistic over the whole pack (a norm, a maximum, a scale, a threshold, a
+shape) couples the members, and one member's training then depends on what it
+is packed with.
+
+Separable, so safe:
+
+- The summed loss `losses.sum()`. A *mean* over members also keeps them
+  separate, but scales every gradient by 1/K, which changes SGD's effective
+  learning rate and Adam's balance against `eps`.
+- Elementwise optimizers: SGD (with momentum), Adam, AdamW, RMSprop. Weight
+  decay, gradient accumulation, EMA and SWA weight averaging.
+- Learning-rate schedules that depend only on the step (cosine, step, warmup).
+- Data-parallel training (DDP averages gradients elementwise) and `torch.compile`.
+
+Couples the members:
+
+- **Global gradient clipping:** `clip_grad_norm_(model.parameters(), ...)` uses
+  one norm for the whole pack. A member with large gradients shrinks everyone
+  else's step. Clip each member's slice separately, or not at all.
+- **Mixed-precision loss scaling:** `torch.amp.GradScaler` keeps one scale and
+  skips the *whole* optimizer step when any gradient is inf or NaN, so one
+  member's overflow skips a step for all of them. bf16 autocast needs no scaler
+  and is fine.
+- **Optimizers with per-tensor or cross-element statistics:** layer-wise trust
+  ratios (LARS, LAMB), factored or matrix preconditioners (Adafactor, Shampoo,
+  Muon), and SAM's global perturbation norm all look across a packed tensor or
+  the whole model. Check that an optimizer's state is per element before using it.
+- **Metric-driven schedules on an aggregate:** `ReduceLROnPlateau` or early
+  stopping on the pack's mean validation loss ties every member to the others.
+  Track metrics per member, and keep each member's best weights with
+  `member_state_dict(k)`.
+- **Re-initializing parameters** with `torch.nn.init` on the packed tensors:
+  initializers that use the fan-out or the whole matrix (`xavier_*`,
+  `orthogonal_`) see the packed shape, not one member's. Use `from_seeds` or
+  `load_state_dicts` instead.
+- **Regularizers or pruning over the whole model** that aren't sums of
+  per-member terms, such as a penalty on the total weight norm (not squared)
+  or a global magnitude-pruning threshold.
+
+Shared by construction:
+
+- **Hyperparameters.** All members share the architecture, optimizer settings,
+  learning-rate schedule and batch size. Pack runs that differ only in seed
+  and data (folds, subjects), not runs from a hyperparameter sweep.
+- **Dropout's RNG** (see Caveats).
+
 ## Caveats
 
 - **Dropout shares one RNG across the pack.** A member's initial weights and
@@ -183,9 +236,6 @@ BatchNorm, and the running statistics are updated the same way.
   composition, not per run.
 - **Packed runs need equal training-set sizes:** every step draws one batch per
   member. Subsample to equal sizes or group runs by size.
-- **Anything computed over all parameters at once couples the members.** For
-  example, `clip_grad_norm_(model.parameters(), ...)` uses one norm for the
-  whole pack. Clip per member instead, or not at all.
 - **Float32 variance:** `var = E[u^2] - mu^2` can lose precision when the
   temporal-filter output has a large mean relative to its spread. On roughly
   standardized inputs it matches braindecode to about 1e-4 in float32 (tested),
