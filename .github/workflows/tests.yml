@@ -1,0 +1,26 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: "3.10"
+            braindecode: "braindecode==1.2.0"  # oldest supported
+          - python: "3.13"
+            braindecode: "braindecode"  # latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install
+        run: |
+          uv venv --python ${{ matrix.python }}
+          uv pip install --torch-backend cpu -e . pytest "${{ matrix.braindecode }}"
+      - name: Test
+        run: .venv/bin/pytest -q tests

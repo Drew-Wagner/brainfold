@@ -1,0 +1,28 @@
+# EEGNet on BNCI2014001 (BCI Competition IV 2a), 4-class motor imagery,
+# leave-one-session-out: per subject, train on one session, test on the other.
+
+data:  # braindecode's MOABBDataset + preprocessing, as in its BNCI2014001 tutorials
+  subjects: [1, 2, 3, 4, 5, 6, 7, 8, 9]
+  sfreq: 128  # Hz, after resampling; 4 s trials -> 512 samples
+  l_freq: 4  # band-pass, Hz
+  h_freq: 38
+  factor_new: 0.001  # exponential moving standardization
+  init_block_size: 1000
+
+model:  # braindecode EEGNet arguments (PackedEEGNet takes the same ones)
+  F1: 8
+  D: 2
+  kernel_length: 64  # 0.5 s at 128 Hz
+  depthwise_kernel_length: 16
+  pool1_kernel_size: 4
+  pool2_kernel_size: 8
+  drop_prob: 0.25
+  final_layer_with_constraint: true  # max-norm linear classifier, as in the EEGNet paper
+  norm_rate: 0.25
+
+train:
+  seeds: [0]  # every seed repeats all 18 folds
+  epochs: 300
+  lr: 0.001  # Adam, cosine-annealed to 0
+  batch_size: 64
+  pack_size: 18  # runs per PackedEEGNet; throughput stops improving at about 18
