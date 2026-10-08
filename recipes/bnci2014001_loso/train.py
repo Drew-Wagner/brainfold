@@ -1,13 +1,15 @@
-"""Leave-one-session-out EEGNet on BNCI2014001, every (seed, fold) run trained at once.
+"""Leave-one-session-out EEGNet or ATCNet on BNCI2014001, every (seed, fold) run trained at once.
 
 Per subject, train on one session and test on the other: 9 subjects x 2 folds =
 18 runs per seed. Runs are trained in packs of `train.pack_size`. Data loading
 and preprocessing follow braindecode's BNCI2014001 tutorials.
-Hyperparameters come from hparams.yaml; override any of them with --set.
+Hyperparameters come from hparams.yaml (EEGNet) or hparams_atcnet.yaml
+(ATCNet); override any of them with --set.
 
     python train.py
+    python train.py --hparams hparams_atcnet.yaml
     python train.py --set train.seeds=[0,1,2]
-    python train.py --baseline       # also train every run alone as a braindecode EEGNet
+    python train.py --baseline       # also train every run alone as a braindecode model
     python train.py --set data.subjects=[1] train.epochs=3 --device cpu   # smoke test
 """
 
@@ -33,14 +35,19 @@ from braindecode.preprocessing import (
 )
 from sklearn.metrics import cohen_kappa_score
 
-from packed_eegnet import PackedEEGNet
+from brainfold import PackedATCNet, PackedEEGNet
 
 warnings.filterwarnings("ignore", message=".*final_layer_with_constraint.*")
 mne.set_log_level("WARNING")
 
+ARCHITECTURES = {"EEGNet": PackedEEGNet, "ATCNet": PackedATCNet}
 
-def load_data(subjects, sfreq, l_freq, h_freq, factor_new, init_block_size):
-    """Trials (n, n_chans, n_times), labels, and each trial's subject and session."""
+
+def load_data(subjects, sfreq, l_freq, h_freq, factor_new, init_block_size, trial_start_offset_seconds=0.0):
+    """Trials (n, n_chans, n_times), labels, and each trial's subject and session.
+
+    Trials are the 4 s after each cue, plus ``-trial_start_offset_seconds`` before it.
+    """
     dataset = MOABBDataset("BNCI2014_001", subject_ids=subjects)
     preprocess(dataset, [
         Preprocessor("pick_types", eeg=True, meg=False, stim=False),
@@ -49,7 +56,9 @@ def load_data(subjects, sfreq, l_freq, h_freq, factor_new, init_block_size):
         Preprocessor("resample", sfreq=sfreq),
         Preprocessor(exponential_moving_standardize, factor_new=factor_new, init_block_size=init_block_size),
     ])
-    windows = create_windows_from_events(dataset, preload=True)
+    sfreq = dataset.datasets[0].raw.info["sfreq"]
+    windows = create_windows_from_events(
+        dataset, trial_start_offset_samples=round(trial_start_offset_seconds * sfreq), preload=True)
     X, y, subject, session = [], [], [], []
     for recording in windows.datasets:
         for i in range(len(recording)):
@@ -61,14 +70,20 @@ def load_data(subjects, sfreq, l_freq, h_freq, factor_new, init_block_size):
     return np.stack(X).astype(np.float32), np.array(y), np.array(subject), np.array(session)
 
 
-def fit(model, X, y, train_idx, seeds, epochs, lr, batch_size):
+def fit(model, X, y, train_idx, seeds, epochs, lr, batch_size, weight_decay=None):
     """Train every member with Adam and a cosine learning-rate schedule.
 
     ``model`` maps (batch, K, n_chans, n_times) to (batch, K, n_outputs). Member k
     trains on ``X[train_idx[k]]`` (equal sizes required), shuffled by ``seeds[k]`` alone.
+    ``weight_decay`` (ATCNet only), {"conv": ..., "dense": ...}, is the official
+    ATCNet code's L2 weight decay, through ``source_optimizer_param_groups``.
     """
     generators = [torch.Generator(device=train_idx.device).manual_seed(seed) for seed in seeds]
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    if weight_decay:
+        params = model.source_optimizer_param_groups(weight_decay["conv"], weight_decay["dense"])
+    else:
+        params = model.parameters()
+    optimizer = torch.optim.Adam(params, lr=lr)
     n_train = train_idx.shape[1]
     for epoch in range(epochs):
         for group in optimizer.param_groups:
@@ -94,7 +109,7 @@ def predict(model, X, idx, batch_size=64):
 
 
 class PackOfOne(torch.nn.Module):
-    """A single braindecode EEGNet with the packed (batch, 1, ...) interface, for the baseline."""
+    """A single braindecode model with the packed (batch, 1, ...) interface, for the baseline."""
 
     def __init__(self, model):
         super().__init__()
@@ -102,6 +117,9 @@ class PackOfOne(torch.nn.Module):
 
     def forward(self, x):
         return self.model(x[:, 0])[:, None]
+
+    def source_optimizer_param_groups(self, *args):
+        return self.model.source_optimizer_param_groups(*args)
 
 
 def folds(subjects, sessions):
@@ -135,14 +153,16 @@ def scores(preds, labels):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--hparams", default=Path(__file__).with_name("hparams.yaml"))
+    parser.add_argument("--hparams", default="hparams.yaml",
+                        help="hparams.yaml (EEGNet) or hparams_atcnet.yaml (ATCNet); relative to this directory")
     parser.add_argument("--set", nargs="+", default=[], metavar="KEY=VALUE", help="e.g. train.epochs=100")
     parser.add_argument("--baseline", action="store_true",
-                        help="also train each run alone as a braindecode EEGNet, from the same initial weights")
+                        help="also train each run alone as a braindecode model, from the same initial weights")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
-    hp = load_hparams(args.hparams, args.set)
+    hp = load_hparams(Path(__file__).parent / args.hparams, args.set)
     train = hp["train"]
+    architecture = hp.get("architecture", "EEGNet")
 
     X, y, subjects, sessions = load_data(**hp["data"])
     n_classes = len(np.unique(y))
@@ -150,6 +170,7 @@ def main():
     runs = [(name, seed, torch.from_numpy(train_mask.nonzero()[0]), torch.from_numpy(test_mask.nonzero()[0]))
             for seed in train["seeds"] for name, train_mask, test_mask in folds(subjects, sessions)]
 
+    print(f"{architecture}: {len(runs)} runs, trials of {X.shape[1]} channels x {X.shape[2]} samples", flush=True)
     methods = ["packed", "braindecode"] if args.baseline else ["packed"]
     results, seconds = {m: [] for m in methods}, dict.fromkeys(methods, 0.0)
     for start in range(0, len(runs), train["pack_size"]):
@@ -158,19 +179,20 @@ def main():
         train_idx = torch.stack([idx for _, _, idx, _ in pack]).to(args.device)  # equal sizes required
         test_idx = torch.stack([idx for _, _, _, idx in pack]).to(args.device)
         labels = y[test_idx.T].cpu()
-        model = PackedEEGNet.from_seeds(seeds, X.shape[1], n_classes, X.shape[2], **hp["model"]).to(args.device)
-        eegnets = model.to_braindecode() if args.baseline else []  # copies of the initial weights
+        model = ARCHITECTURES[architecture].from_seeds(
+            seeds, n_chans=X.shape[1], n_outputs=n_classes, n_times=X.shape[2], **hp["model"]).to(args.device)
+        singles = model.to_braindecode() if args.baseline else []  # copies of the initial weights
+        settings = (train["epochs"], train["lr"], train["batch_size"], train.get("weight_decay"))
 
         t0 = time.perf_counter()
-        fit(model, X, y, train_idx, seeds, train["epochs"], train["lr"], train["batch_size"])
+        fit(model, X, y, train_idx, seeds, *settings)
         pack_scores = {"packed": scores(predict(model, X, test_idx).cpu(), labels)}
         seconds["packed"] += time.perf_counter() - t0
 
         if args.baseline:
             t0, preds = time.perf_counter(), []
-            for k, eegnet in enumerate(eegnets):
-                single = fit(PackOfOne(eegnet), X, y, train_idx[k : k + 1], seeds[k : k + 1],
-                             train["epochs"], train["lr"], train["batch_size"])
+            for k, single in enumerate(singles):
+                single = fit(PackOfOne(single), X, y, train_idx[k : k + 1], seeds[k : k + 1], *settings)
                 preds.append(predict(single, X, test_idx[k : k + 1]).cpu())
             pack_scores["braindecode"] = scores(torch.cat(preds, 1), labels)
             seconds["braindecode"] += time.perf_counter() - t0

@@ -1,0 +1,47 @@
+# ATCNet on BNCI2014001 (BCI Competition IV 2a), 4-class motor imagery,
+# leave-one-session-out: per subject, train on one session, test on the other.
+# The model and its weight decay follow the official ATCNet code (Altaheri et
+# al., 2022): 4.5 s trials at 250 Hz (1.5 s to 6 s of each trial, i.e. from
+# 0.5 s before the cue). Unlike the official code, the preprocessing is
+# braindecode's (as for EEGNet), the learning rate follows a cosine schedule
+# over a fixed number of epochs, and no model is selected on the test session.
+
+architecture: ATCNet
+
+data:  # braindecode's MOABBDataset + preprocessing, as in its BNCI2014001 tutorials
+  subjects: [1, 2, 3, 4, 5, 6, 7, 8, 9]
+  sfreq: 250  # Hz, the recording's rate; 4.5 s trials -> 1125 samples
+  l_freq: 4  # band-pass, Hz
+  h_freq: 38
+  factor_new: 0.001  # exponential moving standardization
+  init_block_size: 1000
+  trial_start_offset_seconds: -0.5  # start 0.5 s before the cue
+
+model:  # braindecode ATCNet arguments (PackedATCNet takes the same ones); its defaults
+  conv_block_n_filters: 16
+  conv_block_kernel_length_1: 64
+  conv_block_kernel_length_2: 16
+  conv_block_pool_size_1: 8
+  conv_block_pool_size_2: 7
+  conv_block_depth_mult: 2
+  conv_block_dropout: 0.3
+  n_windows: 5
+  head_dim: 8
+  num_heads: 2
+  att_drop_prob: 0.5
+  tcn_depth: 2
+  tcn_kernel_size: 4
+  tcn_drop_prob: 0.3
+  concat: false  # average the windows' logits, as the official code does
+  max_norm_const: 0.25
+  conv_max_norm_const: 0.6  # the official code's max-norm on conv kernels; --baseline needs braindecode >= 1.7
+
+train:
+  seeds: [0]  # every seed repeats all 18 folds
+  epochs: 500
+  lr: 0.001  # Adam, cosine-annealed to 0
+  batch_size: 64
+  pack_size: 18  # runs per PackedATCNet; throughput stops improving at about 18
+  weight_decay:  # the official code's L2: conv and TCN kernels, final layer
+    conv: 0.009
+    dense: 0.5
