@@ -1,5 +1,6 @@
-"""Train many EEGNets at once as one packed network."""
+"""Train many EEGNets or ATCNets at once as one packed network."""
 
-from .model import PackedEEGNet
+from .atcnet import PackedATCNet
+from .eegnet import PackedEEGNet
 
-__all__ = ["PackedEEGNet"]
+__all__ = ["PackedATCNet", "PackedEEGNet"]

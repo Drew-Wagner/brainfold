@@ -1,7 +1,7 @@
 [project]
 name = "packed-eegnet"
 version = "0.1.0"
-description = "Train many EEGNets at once as one packed network, with a cheaper first block"
+description = "Train many EEGNets or ATCNets at once as one packed network, with a cheaper first block"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"

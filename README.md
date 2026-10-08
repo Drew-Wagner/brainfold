@@ -1,6 +1,6 @@
 # packed-eegnet
 
-Train many EEGNets at once, 4-7x faster per model on a GPU.
+Train many EEGNets or ATCNets at once, 4-8x faster per model on a GPU.
 
 EEG benchmarks train hundreds of small EEGNets (seeds x folds x subjects), one
 at a time. `PackedEEGNet` trains K of them as one network and computes
@@ -9,14 +9,18 @@ separate braindecode `EEGNet` (Lawhern et al., 2018) would: the tests check
 forward passes, BatchNorm running statistics and Adam training steps against K
 separate models in float64.
 
+`PackedATCNet` does the same for braindecode's `ATCNet` (Altaheri et al.,
+2022), and also packs ATCNet's sliding windows, which braindecode runs one
+after another. See [ATCNet](#atcnet).
+
 ## Install
 
 ```bash
 pip install "packed-eegnet @ git+https://github.com/Drew-Wagner/packed-eegnet"
 ```
 
-The package depends only on PyTorch. Extras: `[braindecode]` (braindecode >= 1.2)
-for `to_braindecode()` and `from_braindecode()`, `[recipes]` for the recipes.
+The package depends only on PyTorch. Extras: `[braindecode]` (braindecode >= 1.2;
+>= 1.4 for ATCNet) for `to_braindecode()` and `from_braindecode()`, `[recipes]` for the recipes.
 
 For development:
 
@@ -72,6 +76,46 @@ model.load_state_dicts(best_state)  # every member at its own best epoch
 training (evaluation, saving, the Hugging Face Hub), and
 `PackedEEGNet.from_braindecode(models)` packs existing ones.
 
+## ATCNet
+
+`PackedATCNet(K, **kwargs)` is K braindecode `ATCNet(**kwargs)`, with the same
+interface as `PackedEEGNet`: input `(batch, K, n_chans, n_times)`, output
+`(batch, K, n_outputs)`, and `from_seeds`, `member_state_dict`,
+`to_braindecode` and `from_braindecode` (state dicts in `ATCNet`'s format).
+It takes `ATCNet`'s arguments with the same defaults, including the shrinking
+of kernels, pools and windows that `ATCNet` applies to short inputs, so
+`n_times` around 1125 (4.5 s at 250 Hz) is what the defaults expect.
+
+```python
+from packed_eegnet import PackedATCNet
+
+model = PackedATCNet.from_seeds(seeds, n_chans=22, n_outputs=4, n_times=1125).cuda()
+```
+
+The training loop is the one above. The tests check forward passes,
+BatchNorm running statistics and Adam training steps against K separate
+`ATCNet`s in float64, for the default configuration and for variants (other
+sizes, `concat`, one window, short inputs, `conv_max_norm_const`).
+
+`ATCNet` is a conv block followed by `n_windows` (default 5) branches, each an
+attention block and a TCN with its own weights, reading overlapping windows of
+the conv block's output. `PackedATCNet` packs those branches the way it packs
+members: all K x `n_windows` attention blocks and TCNs run as one grouped op
+each. The conv block starts with EEGNet's temporal conv -> BatchNorm ->
+spatial conv and uses the same reordering (see [How it works](#how-it-works)).
+
+Notes specific to ATCNet:
+
+- **braindecode's `concat=True` fails** (as of 1.8.1) when `n_windows > 1`: its
+  forward pairs windows with final layers, and with `concat` there is only
+  one, so only the first window runs and the final layer gets the wrong input
+  size. `PackedATCNet(concat=True)` concatenates all windows, as `ATCNet`
+  documents; the tests compare it with braindecode's own submodules run that
+  way.
+- The attention block's extra dropout is fixed at 0.3 in braindecode, and in
+  `PackedATCNet` too (`model.att_block_drop`).
+- `tcn_activation`s with parameters, such as `PReLU`, raise a `ValueError`.
+
 ## Recipes
 
 `recipes/bnci2014001_loso/` trains EEGNet on BNCI2014001 (BCI Competition IV
@@ -117,6 +161,16 @@ at a time; "torch.func" is PyTorch's ensembling recipe over 18 braindecode
 
 Throughput stops improving at about K=18. With K=1, `PackedEEGNet` is about
 2x *slower* than braindecode's `EEGNet`; the gain appears from about K=4.
+
+ATCNet with its defaults (1125 samples, `--model atcnet`):
+
+| training set | braindecode | torch.func, K=18 | packed, K=1 | K=4 | K=9 | K=18 | K=36 |
+|---|---|---|---|---|---|---|---|
+| 4608 trials | 1.169 | 1.130 (1.0x) | 0.522 (2.2x) | 0.242 | 0.183 | **0.149 (7.8x)** | 0.138 (8.5x) |
+| 288 trials | 0.080 | 0.073 (1.1x) | 0.043 (1.9x) | 0.016 | 0.012 | **0.011 (7.6x)** | 0.010 (8.2x) |
+
+Unlike `PackedEEGNet`, `PackedATCNet` is already 2x faster with K=1, because
+it runs the windows' branches together.
 
 ## Why not PyTorch's ensembling recipe?
 
