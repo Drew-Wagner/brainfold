@@ -1,12 +1,14 @@
-"""Training time per model per epoch: braindecode EEGNet one at a time, torch.func
-ensembling (vmap) of braindecode EEGNets, and PackedEEGNet.
+"""Training time per model per epoch: the braindecode model one at a time, torch.func
+ensembling (vmap) of braindecode models, and the packed model.
 
-Random data shaped like BNCI2014001 (22 electrodes, 513 samples, 4 classes).
-The default 4608 trials is a leave-one-subject-out training set; use 288 for
+Random data shaped like BNCI2014001 (22 electrodes, 4 classes): 513 samples for
+EEGNet (128 Hz), 1125 for ATCNet (4.5 s at 250 Hz, its defaults). The default
+4608 trials is a leave-one-subject-out training set; use 288 for
 leave-one-session-out.
 
     python benchmarks/bench_packing.py
     python benchmarks/bench_packing.py --n-trials 288
+    python benchmarks/bench_packing.py --model atcnet
 """
 
 from __future__ import annotations
@@ -18,10 +20,10 @@ import warnings
 
 import torch
 import torch.nn.functional as F
-from braindecode.models import EEGNet
+from braindecode.models import ATCNet, EEGNet
 from torch.func import functional_call, stack_module_state, vmap
 
-from packed_eegnet import PackedEEGNet
+from packed_eegnet import PackedATCNet, PackedEEGNet
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", message=".*batching rule.*")  # vmap falls back to a loop for renorm
@@ -64,34 +66,46 @@ def torch_func_ensemble(models):
     return (lambda x: call(params, buffers, x)), list(params.values())
 
 
+# (name, braindecode model, packed model, the configurations benchmarked)
+MODELS = {
+    "eegnet": ("EEGNet", EEGNet, PackedEEGNet, [dict(F1=4, D=2), dict(F1=8, D=2)]),
+    "atcnet": ("ATCNet", ATCNet, PackedATCNet, [dict()]),
+}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--model", choices=MODELS, default="eegnet")
     parser.add_argument("--pack-sizes", type=int, nargs="+", default=[1, 4, 9, 18, 36])
-    parser.add_argument("--vmap-size", type=int, default=18, help="K for the torch.func ensemble")
+    parser.add_argument("--vmap-size", type=int, default=18, help="K for the torch.func ensemble (0: skip)")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--n-trials", type=int, default=4608)
     parser.add_argument("--n-chans", type=int, default=22)
-    parser.add_argument("--n-times", type=int, default=513)
+    parser.add_argument("--n-times", type=int, help="default: 513 for EEGNet, 1125 for ATCNet")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
+    args.n_times = args.n_times or (513 if args.model == "eegnet" else 1125)
     torch.backends.cudnn.benchmark = True
-    shape = (args.n_chans, 4, args.n_times)
+    name, model_class, packed_class, configs = MODELS[args.model]
+    shape = dict(n_chans=args.n_chans, n_outputs=4, n_times=args.n_times)
 
-    print(f"{'F1':>3s} {'D':>2s} {'model':>24s} {'s/model/epoch':>14s} {'speedup':>8s}")
-    for F1, D in [(4, 2), (8, 2)]:
-        def row(name, forward, parameters, K):
+    print(f"{'config':>12s} {'model':>26s} {'s/model/epoch':>14s} {'speedup':>8s}")
+    for config in configs:
+        label = " ".join(f"{k}={v}" for k, v in config.items()) or "default"
+
+        def row(title, forward, parameters, K):
             seconds = seconds_per_epoch(forward, parameters, K, args) / K
-            print(f"{F1:3d} {D:2d} {name:>24s} {seconds:14.4f} {base / seconds:8.1f}", flush=True)
+            print(f"{label:>12s} {title:>26s} {seconds:14.4f} {base / seconds:8.1f}", flush=True)
 
-        base = seconds_per_epoch(*single(EEGNet(*shape, F1=F1, D=D).to(args.device)), 1, args)
-        print(f"{F1:3d} {D:2d} {'braindecode EEGNet':>24s} {base:14.4f} {1:8.1f}", flush=True)
-        K = args.vmap_size
-        row(f"torch.func ensemble K={K}",
-            *torch_func_ensemble([EEGNet(*shape, F1=F1, D=D).to(args.device) for _ in range(K)]), K)
+        base = seconds_per_epoch(*single(model_class(**shape, **config).to(args.device)), 1, args)
+        print(f"{label:>12s} {'braindecode ' + name:>26s} {base:14.4f} {1:8.1f}", flush=True)
+        if K := args.vmap_size:
+            row(f"torch.func ensemble K={K}",
+                *torch_func_ensemble([model_class(**shape, **config).to(args.device) for _ in range(K)]), K)
         for K in args.pack_sizes:
-            model = PackedEEGNet(K, *shape, F1=F1, D=D).to(args.device)
-            row(f"PackedEEGNet K={K}", model, list(model.parameters()), K)
+            model = packed_class(K, **shape, **config).to(args.device)
+            row(f"Packed{name} K={K}", model, list(model.parameters()), K)
 
 
 if __name__ == "__main__":
