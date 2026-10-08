@@ -1,7 +1,7 @@
 [project]
-name = "packed-eegnet"
+name = "brainfold"
 version = "0.1.0"
-description = "Train many EEGNets or ATCNets at once as one packed network, with a cheaper first block"
+description = "Train every fold, seed and subject of an EEG decoding benchmark at once, as one packed network"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"

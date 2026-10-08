@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from braindecode.models import ATCNet, EEGNet
 from torch.func import functional_call, stack_module_state, vmap
 
-from packed_eegnet import PackedATCNet, PackedEEGNet
+from brainfold import PackedATCNet, PackedEEGNet
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", message=".*batching rule.*")  # vmap falls back to a loop for renorm

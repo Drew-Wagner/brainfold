@@ -193,6 +193,23 @@ class PackedATCNet(PackedModel):
         h = torch.einsum("bgte,gfe->bgtf", h, self.out_weight) + self.out_bias[:, None]
         return x + self.att_block_drop(self.att_drop(h))
 
+    def source_optimizer_param_groups(self, conv_weight_decay: float = 0.009,
+                                      dense_weight_decay: float = 0.5) -> list[dict]:
+        """braindecode ``ATCNet.source_optimizer_param_groups``: the official code's L2 weight decay.
+
+        Conv and TCN kernels decay by ``conv_weight_decay``, the final layer's weights
+        by ``dense_weight_decay``, everything else not at all. Coupled weight decay
+        (Adam, SGD) is elementwise, so the members stay independent.
+        """
+        conv = [self.temporal_weight, self.spatial_weight, self.refine_weight]
+        conv += [weight for block in self.tcn for weight, _, _ in block.layers()]
+        decayed = {id(p) for p in conv} | {id(self.classifier_weight)}
+        return [
+            {"params": conv, "weight_decay": conv_weight_decay},
+            {"params": [self.classifier_weight], "weight_decay": dense_weight_decay},
+            {"params": [p for p in self.parameters() if id(p) not in decayed], "weight_decay": 0.0},
+        ]
+
     # ---- conversion to and from K separate braindecode ATCNets --------------------
 
     def braindecode_kwargs(self) -> dict:

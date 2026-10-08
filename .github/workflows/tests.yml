@@ -12,7 +12,7 @@ jobs:
       matrix:
         include:
           - python: "3.10"
-            braindecode: "braindecode==1.2.0"  # oldest supported
+            braindecode: "braindecode==1.2.0"  # oldest supported (ATCNet tests skip: need >= 1.4)
           - python: "3.13"
             braindecode: "braindecode"  # latest
     steps:

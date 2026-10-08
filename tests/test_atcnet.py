@@ -7,7 +7,7 @@ import pytest
 import torch
 from braindecode.models import ATCNet
 
-from packed_eegnet import PackedATCNet
+from brainfold import PackedATCNet
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", message=".*n_times.*smaller than the minimum.*")
@@ -127,6 +127,28 @@ def test_adam_training(n_times, config):
         packed_optimizer.zero_grad()
         losses = torch.nn.functional.cross_entropy(packed(x).permute(0, 2, 1), y, reduction="none").mean(0)
         losses.sum().backward()  # sum of member mean losses: each member gets its own gradient
+        packed_optimizer.step()
+    assert_same_state(packed, models)
+
+
+@pytest.mark.skipif(not hasattr(ATCNet, "source_optimizer_param_groups"), reason="needs braindecode >= 1.7")
+def test_source_weight_decay():
+    """Adam with the official code's weight decay groups == braindecode's groups."""
+    n_times, config = 257, dict(SMALL, conv_max_norm_const=0.6)
+    models = members(n_times, **config)
+    packed = pack(models)
+    optimizers = [torch.optim.Adam(m.source_optimizer_param_groups(), lr=1e-2) for m in models]
+    packed_optimizer = torch.optim.Adam(packed.source_optimizer_param_groups(), lr=1e-2)
+    assert sum(len(g["params"]) for g in packed_optimizer.param_groups) == len(list(packed.parameters()))
+    for step in range(3):
+        x, y = inputs(n_times, seed=step)
+        for k, (model, optimizer) in enumerate(zip(models, optimizers)):
+            optimizer.zero_grad()
+            torch.nn.functional.cross_entropy(model(x[:, k]), y[:, k]).backward()
+            optimizer.step()
+        packed_optimizer.zero_grad()
+        losses = torch.nn.functional.cross_entropy(packed(x).permute(0, 2, 1), y, reduction="none").mean(0)
+        losses.sum().backward()
         packed_optimizer.step()
     assert_same_state(packed, models)
 

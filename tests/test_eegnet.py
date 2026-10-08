@@ -6,7 +6,7 @@ import pytest
 import torch
 from braindecode.models import EEGNet
 
-from packed_eegnet import PackedEEGNet
+from brainfold import PackedEEGNet
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
