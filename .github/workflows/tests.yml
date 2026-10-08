@@ -2,6 +2,7 @@ name: tests
 
 on:
   push:
+    branches: [main]  # other branches are tested through their pull requests
   pull_request:
 
 jobs:
