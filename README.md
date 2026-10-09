@@ -218,6 +218,24 @@ braindecode runs differ only in their dropout masks, so their per-run
 difference is noise around zero. Packing makes training and evaluation 5.8x
 to 14.1x faster.
 
+On an H100 2g.20gb MIG slice (2/7 of the GPU), seed 0 with `--baseline`, and
+`train.pack_size` set from [the sweep](#h100-mig-slices):
+
+| task | dataset | model | runs | metric | packed | braindecode | packed - braindecode, per run | packed time | braindecode time | speedup |
+|---|---|---|---|---|---|---|---|---|---|---|
+| MI | BNCI2014_001 | EEGNet | 18 | accuracy | 0.683 ± 0.172 | 0.686 ± 0.151 | -0.003 ± 0.033 | 18 s | 105 s | 5.7x |
+| MI | BNCI2014_001 | ATCNet | 18 | accuracy | 0.690 ± 0.142 | 0.693 ± 0.140 | -0.003 ± 0.034 | 131 s | 861 s | 6.6x |
+| MI | Lee2019_MI | EEGNet | 108 | accuracy | 0.692 ± 0.147 | 0.693 ± 0.144 | -0.001 ± 0.053 | 95 s | 1830 s | 19.3x |
+| MI | Lee2019_MI | ATCNet | 108 | accuracy | 0.673 ± 0.160 | 0.676 ± 0.157 | -0.004 ± 0.049 | 614 s | 7829 s | 12.7x |
+| P300 | BNCI2014_009 | EEGNet | 30 | roc auc | 0.949 ± 0.046 | 0.950 ± 0.045 | -0.000 ± 0.002 | 13 s | 89 s | 7.1x |
+| P300 | BNCI2014_009 | ATCNet | 30 | roc auc | 0.754 ± 0.074 | 0.753 ± 0.076 | +0.001 ± 0.016 | 38 s | 276 s | 7.2x |
+| SSVEP | Nakanishi2015 | EEGNet | 45 | accuracy | 0.833 ± 0.238 | 0.841 ± 0.216 | -0.009 ± 0.070 | 21 s | 66 s | 3.2x |
+| SSVEP | Nakanishi2015 | ATCNet | 45 | accuracy | 0.955 ± 0.100 | 0.962 ± 0.090 | -0.007 ± 0.032 | 136 s | 1302 s | 9.6x |
+
+Each speedup is 2-15% below the sweep's best speedup for training alone,
+which leaves out evaluation. The CSVs are in
+[`recipes/moabb/results/h100-mig/recipes-2g.20gb`](recipes/moabb/results/h100-mig/recipes-2g.20gb).
+
 ATCNet was designed for motor imagery. On P300, the 0.8 s trials are shorter
 than it needs, so it shrinks its kernels, pools and windows, and it does much
 worse than EEGNet. These recipes show that packing gives the same results
