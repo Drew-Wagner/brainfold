@@ -42,7 +42,7 @@ train:
   epochs: 500
   lr: 0.001  # Adam, cosine-annealed to 0
   batch_size: 64
-  pack_size: 15
+  pack_size: 45  # every fold in one pack: fastest on 2g.20gb (DRAC sweep)
   weight_decay:  # the official code's L2: conv and TCN kernels, final layer
     conv: 0.009
     dense: 0.5

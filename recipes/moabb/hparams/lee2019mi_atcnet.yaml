@@ -45,7 +45,7 @@ train:
   epochs: 500
   lr: 0.001  # Adam, cosine-annealed to 0
   batch_size: 64
-  pack_size: 18
+  pack_size: 36  # 3 packs: fastest on 2g.20gb (DRAC sweep), about 11 GiB; all 108 would not fit
   weight_decay:  # the official ATCNet code's L2: conv and TCN kernels, final layer
     conv: 0.009
     dense: 0.5
