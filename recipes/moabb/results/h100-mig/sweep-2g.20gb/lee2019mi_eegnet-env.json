@@ -1,0 +1,20 @@
+{
+  "host": "fc11014",
+  "torch": "2.14.1",
+  "cuda": "13.2",
+  "cudnn": 92101,
+  "braindecode": "1.8.1",
+  "moabb": "1.7.2",
+  "mne": "1.13.2",
+  "commit": "3b676632edda1a12f17c6a453a714b7970b1a4d1",
+  "dirty": false,
+  "gpu": "NVIDIA H100 80GB HBM3 MIG 2g.20gb",
+  "gpu_memory": 21072183296,
+  "driver": "580.159.03",
+  "gpu_list": "GPU 0: NVIDIA H100 80GB HBM3 (UUID: GPU-c2c28308-5d7f-dff2-18fa-9229a3943753)\n  MIG 2g.20gb     Device  0: (UUID: MIG-d9b6b098-179b-5513-9e92-b8132c5085ea)",
+  "slurm_cluster_name": "fir",
+  "slurm_job_id": "63853259",
+  "slurm_array_job_id": "63852793",
+  "slurm_array_task_id": "2",
+  "slurmd_nodename": "fc11014"
+}

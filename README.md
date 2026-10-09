@@ -183,6 +183,7 @@ python train.py hparams/nakanishi2015_eegnet.yaml --baseline --out results.csv
 python summarize.py results/rtx4080super/*.csv                  # the table below, from its CSVs
 python train.py hparams/bnci2014001_eegnet.yaml --set data.subjects=[1] train.epochs=3 --device cpu   # smoke test
 python sweep.py hparams/lee2019mi_eegnet.yaml --out sweep.csv     # time and peak memory per pack size K
+python plot_sweep.py results/h100-mig/sweep-*/*.csv --out results/h100-mig   # the plots in Benchmarks
 ```
 
 `--baseline` trains every run a second time as a separate braindecode model,
@@ -295,8 +296,43 @@ ATCNet (defaults, 1125 samples):
 | 288 trials | 0.080 | 0.073 (1.1x) | 0.043 (1.9x) | 0.016 | 0.012 | **0.011 (7.6x)** | 0.010 (8.2x) |
 
 On this GPU, throughput stops improving at about K=18. The best pack size
-likely depends on the GPU's memory and compute, which results on other
-hardware will show.
+depends on the GPU's compute, as the H100 results below show.
+
+### H100 MIG slices
+
+`sweep.py` on every recipe's own data and training loop, on two MIG slices of
+an H100 80GB on DRAC's Fir cluster: 1g.10gb (1/7 of the GPU's compute, 10 GB)
+and 2g.20gb (2/7, 20 GB). Training time per model per epoch against pack size
+K, with one braindecode model dashed and each slice's elbow circled (the
+smallest K within 10% of its best time per model):
+
+![Time per model per epoch against pack size K, on H100 MIG slices](recipes/moabb/results/h100-mig/sweep-time.png)
+
+| | BNCI2014_001 | BNCI2014_009 | Lee2019_MI | Nakanishi2015 |
+|---|---|---|---|---|
+| EEGNet: elbow on 1g.10gb, 2g.20gb | 12, 24 | 16, 32 | 8, 16 | 16, 32 |
+| EEGNet: best speedup on 2g.20gb | 6.7x | 7.8x | 19.8x | 3.6x |
+| ATCNet: elbow on 1g.10gb, 2g.20gb | 6, 12 | 24, 48 | 4, 8 | 8, 16 |
+| ATCNet: best speedup on 2g.20gb | 6.9x | 8.3x | 13.0x | 10.6x |
+
+- Packing is limited by compute, not memory: with twice the compute, every
+  elbow is at twice the pack size, and the best time per model halves. Up to
+  its elbow, every pack used less than 2 GiB on top of the data.
+- Both methods use the same training loop with the data on the GPU, so the
+  K=1 difference is the models' implementations. A pack of one is up to 8.7x
+  faster than braindecode on Lee2019_MI, but slower on BNCI2014_009 and on
+  Nakanishi2015 with EEGNet, where packing pays from K=2.
+
+Each pack size's memory, predicted by `sweep.py` from the smaller ones before
+it ran, against the memory it used (reserved by PyTorch, plus the CUDA context
+and libraries); the dotted lines are 90% of each slice, where the sweep stops:
+
+![Predicted against measured GPU memory per pack size](recipes/moabb/results/h100-mig/sweep-memory.png)
+
+87% of the predictions are within 5%, but PyTorch reserves memory in steps,
+so a few are up to 13% low: more than the 10% headroom. No pack size ran out
+of memory. The CSVs, with each job's environment, are in
+[`recipes/moabb/results/h100-mig`](recipes/moabb/results/h100-mig).
 
 ### Contributing results
 
