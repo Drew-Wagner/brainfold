@@ -1,0 +1,50 @@
+# ATCNet on Lee2019_SSVEP (OpenBMI), 4-class SSVEP (5.45, 6.67, 8.57 and 12 Hz),
+# 54 subjects, 62 channels, 2 sessions of 200 trials (MOABB's train and test runs),
+# cross-session: per subject, train on one session, test on the other.
+# Too large to download on most workstations: run it on a cluster (cluster/drac).
+
+architecture: ATCNet
+
+data:
+  dataset: Lee2019_SSVEP
+  dataset_kwargs: {test_run: true}  # both runs of each session
+  subjects: null  # all 54
+  sfreq: 250  # Hz, after resampling from 1000 Hz; 4 s trials -> 1000 samples
+  l_freq: 4  # band-pass, Hz: the stimulation frequencies and their harmonics
+  h_freq: 40
+  factor_new: 0.001  # exponential moving standardization
+  init_block_size: 1000
+
+evaluation:
+  protocol: cross-session
+
+metrics: [accuracy, kappa]
+
+model:  # braindecode ATCNet arguments (PackedATCNet takes the same ones); its defaults
+  conv_block_n_filters: 16
+  conv_block_kernel_length_1: 64
+  conv_block_kernel_length_2: 16
+  conv_block_pool_size_1: 8
+  conv_block_pool_size_2: 7
+  conv_block_depth_mult: 2
+  conv_block_dropout: 0.3
+  n_windows: 5
+  head_dim: 8
+  num_heads: 2
+  att_drop_prob: 0.5
+  tcn_depth: 2
+  tcn_kernel_size: 4
+  tcn_drop_prob: 0.3
+  concat: false  # average the windows' logits, as the official code does
+  max_norm_const: 0.25
+  conv_max_norm_const: 0.6  # the official code's max-norm on conv kernels; --baseline needs braindecode >= 1.7
+
+train:
+  seeds: [0]  # every seed repeats all 108 folds
+  epochs: 500
+  lr: 0.001  # Adam, cosine-annealed to 0
+  batch_size: 64
+  pack_size: 18
+  weight_decay:  # the official code's L2: conv and TCN kernels, final layer
+    conv: 0.009
+    dense: 0.5

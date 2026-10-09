@@ -1,0 +1,41 @@
+# EEGNet on BNCI2014_009, P300 speller (target vs non-target flashes),
+# 10 subjects, 16 channels, 3 sessions of 576 trials (1 target in 6),
+# cross-session: per subject, test on each session, train on the other two.
+# The classes are unbalanced: the loss is class-weighted and the metrics are
+# ROC AUC and balanced accuracy.
+
+architecture: EEGNet
+
+data:
+  dataset: BNCI2014_009
+  subjects: null  # all 10
+  sfreq: 128  # Hz, after resampling from 256 Hz; 0.8 s trials -> 102 samples
+  l_freq: 1  # band-pass, Hz (MOABB's P300 default)
+  h_freq: 24
+  factor_new: 0.001  # exponential moving standardization
+  init_block_size: 1000
+  mapping: {NonTarget: 0, Target: 1}
+
+evaluation:
+  protocol: cross-session
+
+metrics: [roc_auc, balanced_accuracy]
+
+model:  # braindecode EEGNet arguments (PackedEEGNet takes the same ones)
+  F1: 8
+  D: 2
+  kernel_length: 64  # 0.5 s at 128 Hz, the EEGNet paper's P300 setting
+  depthwise_kernel_length: 16
+  pool1_kernel_size: 4
+  pool2_kernel_size: 8
+  drop_prob: 0.25
+  final_layer_with_constraint: true  # max-norm linear classifier, as in the EEGNet paper
+  norm_rate: 0.25
+
+train:
+  seeds: [0]  # every seed repeats all 30 folds
+  epochs: 100
+  lr: 0.001  # Adam, cosine-annealed to 0
+  batch_size: 64
+  pack_size: 15
+  class_weight: balanced  # each member's loss weighted by its training set's inverse class frequencies

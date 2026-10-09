@@ -9,12 +9,16 @@ leave-one-session-out.
     python benchmarks/bench_packing.py
     python benchmarks/bench_packing.py --n-trials 288
     python benchmarks/bench_packing.py --model atcnet
+    python benchmarks/bench_packing.py --repeats 5 --out eegnet.csv   # median of 5; one CSV row per measurement
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import csv
+import platform
+import statistics
 import time
 import warnings
 
@@ -84,28 +88,46 @@ def main():
     parser.add_argument("--n-times", type=int, help="default: 513 for EEGNet, 1125 for ATCNet")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--repeats", type=int, default=1, help="time each model this many times; report the median")
+    parser.add_argument("--out", help="write one CSV row per measurement, with the environment")
     args = parser.parse_args()
     args.n_times = args.n_times or (513 if args.model == "eegnet" else 1125)
     torch.backends.cudnn.benchmark = True
     name, model_class, packed_class, configs = MODELS[args.model]
     shape = dict(n_chans=args.n_chans, n_outputs=4, n_times=args.n_times)
 
-    print(f"{'config':>12s} {'model':>26s} {'s/model/epoch':>14s} {'speedup':>8s}")
+    environment = dict(host=platform.node(), gpu=torch.cuda.get_device_name(args.device), torch=torch.__version__,
+                       cuda=torch.version.cuda, cudnn=torch.backends.cudnn.version())
+    print(", ".join(f"{k} {v}" for k, v in environment.items()))
+    print(f"{'config':>12s} {'model':>26s} {'s/model/epoch':>14s} {'spread':>8s} {'speedup':>8s}")
+    rows = []
     for config in configs:
         label = " ".join(f"{k}={v}" for k, v in config.items()) or "default"
 
-        def row(title, forward, parameters, K):
-            seconds = seconds_per_epoch(forward, parameters, K, args) / K
-            print(f"{label:>12s} {title:>26s} {seconds:14.4f} {base / seconds:8.1f}", flush=True)
+        def row(title, forward, parameters, K, base=None):
+            """Median seconds per model per epoch over the repeats; spread is (max - min) / median."""
+            times = [seconds_per_epoch(forward, parameters, K, args) / K for _ in range(args.repeats)]
+            seconds = statistics.median(times)
+            speedup = base / seconds if base else 1.0
+            print(f"{label:>12s} {title:>26s} {seconds:14.4f} {(max(times) - min(times)) / seconds:8.1%} {speedup:8.1f}",
+                  flush=True)
+            rows.extend(dict(environment, model=name, config=label, method=title, K=K, n_trials=args.n_trials,
+                             n_chans=args.n_chans, n_times=args.n_times, repeat=i, seconds=s)
+                        for i, s in enumerate(times))
+            return seconds
 
-        base = seconds_per_epoch(*single(model_class(**shape, **config).to(args.device)), 1, args)
-        print(f"{label:>12s} {'braindecode ' + name:>26s} {base:14.4f} {1:8.1f}", flush=True)
+        base = row(f"braindecode {name}", *single(model_class(**shape, **config).to(args.device)), 1)
         if K := args.vmap_size:
             row(f"torch.func ensemble K={K}",
-                *torch_func_ensemble([model_class(**shape, **config).to(args.device) for _ in range(K)]), K)
+                *torch_func_ensemble([model_class(**shape, **config).to(args.device) for _ in range(K)]), K, base)
         for K in args.pack_sizes:
             model = packed_class(K, **shape, **config).to(args.device)
-            row(f"Packed{name} K={K}", model, list(model.parameters()), K)
+            row(f"Packed{name} K={K}", model, list(model.parameters()), K, base)
+    if args.out:
+        with open(args.out, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
 
 
 if __name__ == "__main__":

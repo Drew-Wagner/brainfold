@@ -1,0 +1,50 @@
+# ATCNet on BNCI2014_009, P300 speller: data and evaluation as in
+# hparams/bnci2014009_eegnet.yaml, at 250 Hz. 0.8 s trials are shorter than ATCNet
+# needs, so it shrinks its kernels, pools and windows (with a warning).
+
+architecture: ATCNet
+
+data:
+  dataset: BNCI2014_009
+  subjects: null  # all 10
+  sfreq: 250  # Hz, after resampling from 256 Hz; 0.8 s trials -> 200 samples
+  l_freq: 1  # band-pass, Hz (MOABB's P300 default)
+  h_freq: 24
+  factor_new: 0.001  # exponential moving standardization
+  init_block_size: 1000
+  mapping: {NonTarget: 0, Target: 1}
+
+evaluation:
+  protocol: cross-session
+
+metrics: [roc_auc, balanced_accuracy]
+
+model:  # braindecode ATCNet arguments (PackedATCNet takes the same ones); its defaults
+  conv_block_n_filters: 16
+  conv_block_kernel_length_1: 64
+  conv_block_kernel_length_2: 16
+  conv_block_pool_size_1: 8
+  conv_block_pool_size_2: 7
+  conv_block_depth_mult: 2
+  conv_block_dropout: 0.3
+  n_windows: 5
+  head_dim: 8
+  num_heads: 2
+  att_drop_prob: 0.5
+  tcn_depth: 2
+  tcn_kernel_size: 4
+  tcn_drop_prob: 0.3
+  concat: false  # average the windows' logits, as the official code does
+  max_norm_const: 0.25
+  conv_max_norm_const: 0.6  # the official code's max-norm on conv kernels; --baseline needs braindecode >= 1.7
+
+train:
+  seeds: [0]  # every seed repeats all 30 folds
+  epochs: 100
+  lr: 0.001  # Adam, cosine-annealed to 0
+  batch_size: 64
+  pack_size: 15
+  weight_decay:  # the official code's L2: conv and TCN kernels, final layer
+    conv: 0.009
+    dense: 0.5
+  class_weight: balanced
