@@ -9,6 +9,12 @@ export BRAINFOLD_CACHE=$BRAINFOLD_DATA/cache  # preprocessed trials (recipes/moa
 export BRAINFOLD_RESULTS=$BRAINFOLD_DATA/results
 mkdir -p "$MNE_DATA" "$BRAINFOLD_CACHE" "$BRAINFOLD_RESULTS"
 
+# W&B logs offline (online logging to many runs is slow, and most compute nodes
+# have no internet); sync from a login node: wandb sync $BRAINFOLD_RESULTS/wandb/offline-run-*
+export WANDB_MODE=offline
+export WANDB_DIR=$BRAINFOLD_RESULTS
+export BRAINFOLD_WANDB_PROJECT=${BRAINFOLD_WANDB_PROJECT:-brainfold}
+
 # The recipe configurations (recipes/moabb/hparams/<name>.yaml)
 CONFIGS=(
   bnci2014001_eegnet bnci2014001_atcnet

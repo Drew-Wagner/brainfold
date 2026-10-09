@@ -3,7 +3,7 @@
 #   sbatch --account=def-yourpi cluster/drac/prepare.sbatch
 #SBATCH --job-name=brainfold-prepare
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
+#SBATCH --mem=64G  # Lee2019_ERP: 14 GB of trials, stacked into one array
 #SBATCH --time=4:00:00
 #SBATCH --output=%x-%j.out
 set -euo pipefail

@@ -12,6 +12,10 @@ cached (see --cache-dir). Override any hyperparameter with --set.
     python train.py hparams/bnci2014001_eegnet.yaml --out results.csv   # one row per run and method
     python train.py hparams/bnci2014001_eegnet.yaml --set data.subjects=[1] train.epochs=3 --device cpu   # smoke test
     python train.py hparams/lee2019mi_eegnet.yaml --prepare-only   # download, preprocess and cache, no training
+    python train.py hparams/bnci2014001_eegnet.yaml --out r.csv --wandb brainfold   # also log to W&B
+
+With --out r.csv, every run's training loss per epoch goes to r-losses.csv and
+its test logits and labels to r-logits.npz, so new metrics need no retraining.
 
 Evaluation protocols (`evaluation.protocol`):
     cross-session   per subject, test on each session, train on the others
@@ -22,7 +26,7 @@ Evaluation protocols (`evaluation.protocol`):
 from __future__ import annotations
 
 import argparse
-import csv
+import copy
 import hashlib
 import json
 import math
@@ -49,6 +53,7 @@ from sklearn.metrics import balanced_accuracy_score, cohen_kappa_score, roc_auc_
 from sklearn.model_selection import StratifiedKFold
 
 from brainfold import PackedATCNet, PackedEEGNet
+from tracking import environment, finish_run, start_run, write_csv, write_environment
 
 warnings.filterwarnings("ignore", message=".*final_layer_with_constraint.*")
 mne.set_log_level("WARNING")
@@ -114,6 +119,7 @@ def fit(model, X, y, train_idx, seeds, epochs, lr, batch_size, weight_decay=None
     ATCNet code's L2 weight decay, through ``source_optimizer_param_groups``.
     ``class_weight="balanced"`` weights each member's loss by the inverse class
     frequencies of its own training set, as ``F.cross_entropy(weight=...)`` does.
+    Returns the model and each member's mean training loss per epoch, (epochs, K).
     """
     generators = [torch.Generator(device=train_idx.device).manual_seed(seed) for seed in seeds]
     if weight_decay:
@@ -128,6 +134,7 @@ def fit(model, X, y, train_idx, seeds, epochs, lr, batch_size, weight_decay=None
     elif class_weight is not None:
         raise ValueError(f"unknown class_weight {class_weight!r}")
     members = torch.arange(len(seeds), device=train_idx.device)
+    epoch_losses = torch.zeros(epochs, len(seeds), device=train_idx.device)  # read once at the end: no sync per step
     for epoch in range(epochs):
         for group in optimizer.param_groups:
             group["lr"] = 0.5 * lr * (1 + math.cos(math.pi * epoch / epochs))
@@ -146,7 +153,8 @@ def fit(model, X, y, train_idx, seeds, epochs, lr, batch_size, weight_decay=None
             # and one Adam over the packed parameters == K separate Adams.
             losses.sum().backward()
             optimizer.step()
-    return model
+            epoch_losses[epoch] += losses.detach() * idx.shape[0] / n_train
+    return model, epoch_losses.cpu()
 
 
 @torch.no_grad()
@@ -191,10 +199,10 @@ def folds(protocol, y, subjects, sessions, n_folds=None):
 
 
 def packs(runs, pack_size):
-    """Consecutive runs with equal training-set sizes, at most ``pack_size`` per pack."""
+    """Consecutive runs with equal training- and test-set sizes, at most ``pack_size`` per pack."""
     by_size = {}
     for run in runs:
-        by_size.setdefault(len(run[2]), []).append(run)
+        by_size.setdefault((len(run[2]), len(run[3])), []).append(run)
     for group in by_size.values():
         for start in range(0, len(group), pack_size):
             yield group[start : start + pack_size]
@@ -215,7 +223,9 @@ def scores(logits, labels, metrics):
 
 
 def load_hparams(path, overrides):
-    hparams = yaml.safe_load(Path(path).read_text())
+    """The hparams file (tried as given, then relative to this directory), with ``KEY=VALUE`` overrides."""
+    path = Path(path)
+    hparams = yaml.safe_load((path if path.exists() else Path(__file__).parent / path).read_text())
     for override in overrides:
         key, value = override.split("=", 1)
         *parents, leaf = key.split(".")
@@ -228,73 +238,157 @@ def load_hparams(path, overrides):
     return hparams
 
 
+def add_common_arguments(parser):
+    """The arguments train.py and sweep.py share."""
+    parser.add_argument("hparams", help="hparams file; relative paths are tried here, then in this directory")
+    parser.add_argument("--set", nargs="+", action="extend", default=[], metavar="KEY=VALUE",
+                        help="e.g. train.epochs=100; may be repeated")
+    parser.add_argument("--device", type=torch.device, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--cache-dir", type=lambda s: None if s == "none" else Path(s),
+                        default=str(Path.home() / ".cache" / "brainfold"),
+                        help="where preprocessed trials are cached; 'none' to disable")
+    parser.add_argument("--wandb", metavar="PROJECT", help="log to this W&B project (set WANDB_MODE=offline on clusters)")
+
+
+def warm_up(model, X, y, train_idx, test_idx, seeds, settings):
+    """One throwaway epoch and prediction on a copy of ``model``.
+
+    cudnn.benchmark searches for the fastest algorithms the first time it sees a
+    shape, with workspaces as large as the free memory; this keeps that search out
+    of the timings and peak memory. The RNG state is restored, so dropout masks
+    don't change.
+    """
+    with torch.random.fork_rng(devices=[X.device]):
+        warm = fit(copy.deepcopy(model), X, y, train_idx, seeds, **{**settings, "epochs": 1})[0]
+        predict(warm, X, test_idx)
+
+
+def train_and_predict(model, X, y, train_idx, test_idx, seeds, settings):
+    """Test logits (n, K, n_outputs), training losses (epochs, K), training and evaluation seconds."""
+    t0 = time.perf_counter()
+    model, losses = fit(model, X, y, train_idx, seeds, **settings)  # returns after a sync (.cpu())
+    t1 = time.perf_counter()
+    logits = predict(model, X, test_idx).cpu()
+    return logits, losses, t1 - t0, time.perf_counter() - t1
+
+
+def peak_memory(device):
+    """(allocated, reserved) bytes at their peak since the last call, which they're then reset from.
+
+    Cached memory is released first, so the next peak doesn't start at this one's reserved memory.
+    """
+    if device.type != "cuda":
+        return None, None
+    peak = torch.cuda.max_memory_allocated(device), torch.cuda.max_memory_reserved(device)
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device)
+    return peak
+
+
+def write_results(out, rows, losses, logits):
+    """``out`` (one row per run and method), ``<out>-losses.csv`` and ``<out>-logits.npz``."""
+    paths = [out, out.with_name(f"{out.stem}-losses.csv"), out.with_name(f"{out.stem}-logits.npz")]
+    write_csv(paths[0], rows)
+    write_csv(paths[1], losses)
+    # Every run's test trials, concatenated; run_index says which row of `rows` each belongs to,
+    # trial its index in the cached data
+    np.savez_compressed(paths[2], logits=np.concatenate([run["logits"] for run in logits]),
+                        labels=np.concatenate([run["labels"] for run in logits]),
+                        trial=np.concatenate([run["trials"] for run in logits]),
+                        run_index=np.concatenate([np.full(len(run["labels"]), i) for i, run in enumerate(logits)]),
+                        method=np.array([r["method"] for r in rows]), seed=np.array([r["seed"] for r in rows]),
+                        fold=np.array([r["fold"] for r in rows]))
+    return paths
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("hparams", help="hparams file; relative paths are tried here, then in this directory")
-    parser.add_argument("--set", nargs="+", default=[], metavar="KEY=VALUE", help="e.g. train.epochs=100")
+    add_common_arguments(parser)
     parser.add_argument("--baseline", action="store_true",
                         help="also train each run alone as a braindecode model, from the same initial weights")
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--cache-dir", default=Path.home() / ".cache" / "brainfold",
-                        help="where preprocessed trials are cached; 'none' to disable")
-    parser.add_argument("--out", type=Path, help="write one CSV row per run and method")
+    parser.add_argument("--out", type=Path, help="write one CSV row per run and method, and the losses and logits")
     parser.add_argument("--prepare-only", action="store_true", help="load and cache the trials, then exit")
     args = parser.parse_args()
-    path = Path(args.hparams)
-    hp = load_hparams(path if path.exists() else Path(__file__).parent / path, args.set)
+    hp = load_hparams(args.hparams, args.set)
     data, train, evaluation = hp["data"], hp["train"], hp["evaluation"]
     architecture, metrics = hp["architecture"], hp.get("metrics", ["accuracy", "kappa"])
+    # cuDNN's default heuristics pick slow convolutions with workspaces of GBs for small packed ATCNets
+    torch.backends.cudnn.benchmark = True
 
-    X, y, subjects, sessions = load_cached(data, None if str(args.cache_dir) == "none" else args.cache_dir)
+    t0 = time.perf_counter()
+    X, y, subjects, sessions = load_cached(data, args.cache_dir)
     if args.prepare_only:
         print(f"{data['dataset']}: {len(X)} trials of {X.shape[1]} channels x {X.shape[2]} samples")
         return
-    n_classes = len(np.unique(y))
+    n_classes, data_bytes = len(np.unique(y)), X.nbytes
     X, y = torch.from_numpy(X).to(args.device), torch.from_numpy(y).to(args.device)
+    data_seconds = time.perf_counter() - t0  # loading (or preprocessing) and copying to the device
     runs = [(name, seed, torch.from_numpy(train_idx), torch.from_numpy(test_idx))
             for seed in train["seeds"]
             for name, train_idx, test_idx in folds(evaluation["protocol"], y.cpu().numpy(), subjects, sessions,
                                                    evaluation.get("n_folds"))]
+    env = dict(environment(args.device), data_seconds=data_seconds, data_bytes=data_bytes)
+    run = start_run(args.wandb, "recipe", args.hparams, hp, args, env)
+    paths = [write_environment(args.out, env)] if args.out else []
 
     print(f"{architecture} on {data['dataset']} ({evaluation['protocol']}): {len(runs)} runs, "
           f"{len(X)} trials of {X.shape[1]} channels x {X.shape[2]} samples, {n_classes} classes", flush=True)
     methods = ["packed", "braindecode"] if args.baseline else ["packed"]
-    rows, seconds = [], dict.fromkeys(methods, 0.0)
-    for pack in packs(runs, train["pack_size"]):
-        seeds = [seed for _, seed, _, _ in pack]
+    settings = dict(epochs=train["epochs"], lr=train["lr"], batch_size=train["batch_size"],
+                    weight_decay=train.get("weight_decay"), class_weight=train.get("class_weight"))
+    rows, losses, logits, seconds = [], [], [], dict.fromkeys(methods, 0.0)
+    warmed = set()  # (method, members per model, training size, test size) that cudnn.benchmark has seen
+    for pack_index, pack in enumerate(packs(runs, train["pack_size"])):
+        K, seeds = len(pack), [seed for _, seed, _, _ in pack]
         train_idx = torch.stack([idx for _, _, idx, _ in pack]).to(args.device)
         test_idx = torch.stack([idx for _, _, _, idx in pack]).to(args.device)
         labels = y[test_idx.T].cpu()
         model = ARCHITECTURES[architecture].from_seeds(
             seeds, n_chans=X.shape[1], n_outputs=n_classes, n_times=X.shape[2], **hp["model"]).to(args.device)
-        singles = model.to_braindecode() if args.baseline else []  # copies of the initial weights
-        settings = (train["epochs"], train["lr"], train["batch_size"], train.get("weight_decay"),
-                    train.get("class_weight"))
-
-        t0 = time.perf_counter()
-        fit(model, X, y, train_idx, seeds, *settings)
-        pack_scores = {"packed": scores(predict(model, X, test_idx).cpu(), labels, metrics)}
-        run_seconds = {"packed": [(time.perf_counter() - t0) / len(pack)] * len(pack)}
-
+        # (model, the pack's members it trains): one packed model, or one braindecode model per member
+        # from the same initial weights
+        models = {"packed": [(model, slice(0, K))]}
         if args.baseline:
-            logits, run_seconds["braindecode"] = [], []
-            for k, single in enumerate(singles):
-                t0 = time.perf_counter()
-                single = fit(PackOfOne(single), X, y, train_idx[k : k + 1], seeds[k : k + 1], *settings)
-                logits.append(predict(single, X, test_idx[k : k + 1]).cpu())
-                run_seconds["braindecode"].append(time.perf_counter() - t0)
-            pack_scores["braindecode"] = scores(torch.cat(logits, 1), labels, metrics)
+            models["braindecode"] = [(PackOfOne(single), slice(k, k + 1))
+                                     for k, single in enumerate(model.to_braindecode())]
 
+        results = {}
+        for method in methods:
+            members = K if method == "packed" else 1  # per model
+            shape = (method, members, train_idx.shape[1], test_idx.shape[1])
+            if args.device.type == "cuda" and shape not in warmed:
+                first, part = models[method][0]
+                warm_up(first, X, y, train_idx[part], test_idx[part], seeds[part], settings)
+                warmed.add(shape)
+            peak_memory(args.device)  # reset the peaks
+            outputs = [train_and_predict(m, X, y, train_idx[part], test_idx[part], seeds[part], settings)
+                       for m, part in models[method]]
+            results[method] = dict(
+                logits=torch.cat([o[0] for o in outputs], 1), losses=torch.cat([o[1] for o in outputs], 1),
+                # a packed model's time is shared equally by its members
+                train_seconds=[o[2] / members for o in outputs for _ in range(members)],
+                eval_seconds=[o[3] / members for o in outputs for _ in range(members)],
+                peak=peak_memory(args.device))
+            seconds[method] += sum(o[2] + o[3] for o in outputs)
+
+        pack_scores = {m: scores(results[m]["logits"], labels, metrics) for m in methods}
         for k, (name, seed, _, _) in enumerate(pack):
             line = "  ".join(f"{m} " + " ".join(f"{metric} {pack_scores[m][k][metric]:.3f}" for metric in metrics)
                              for m in methods)
             print(f"seed {seed} {name}  {line}", flush=True)
             for m in methods:
+                result = results[m]
                 rows.append(dict(dataset=data["dataset"], architecture=architecture,
                                  protocol=evaluation["protocol"], method=m, seed=seed, fold=name,
-                                 pack_size=len(pack), seconds=run_seconds[m][k], **pack_scores[m][k]))
-        for m in methods:
-            seconds[m] += sum(run_seconds[m])
+                                 pack=pack_index, pack_size=K, train_seconds=result["train_seconds"][k],
+                                 eval_seconds=result["eval_seconds"][k], peak_allocated=result["peak"][0],
+                                 peak_reserved=result["peak"][1], **pack_scores[m][k]))
+                losses.extend(dict(method=m, seed=seed, fold=name, epoch=epoch, loss=float(loss))
+                              for epoch, loss in enumerate(result["losses"][:, k]))
+                logits.append(dict(logits=result["logits"][:, k].numpy(), labels=labels[:, k].numpy(),
+                                   trials=test_idx[k].cpu().numpy()))
+        if args.out:  # after every pack, so a job that runs out of time keeps what it finished
+            result_paths = write_results(args.out, rows, losses, logits)
 
     for m in methods:
         values = {metric: np.array([r[metric] for r in rows if r["method"] == m]) for metric in metrics}
@@ -305,11 +399,7 @@ def main():
         diff = np.array([r[first] for r in rows if r["method"] == "packed"]) - np.array(
             [r[first] for r in rows if r["method"] == "braindecode"])
         print(f"packed - braindecode {first} per run: {diff.mean():+.3f} ± {diff.std():.3f}")
-    if args.out:
-        with open(args.out, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(rows[0]))
-            writer.writeheader()
-            writer.writerows(rows)
+    finish_run(run, rows, paths + (result_paths if args.out else []), {f"{m}_seconds": s for m, s in seconds.items()})
 
 
 if __name__ == "__main__":

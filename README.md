@@ -182,13 +182,21 @@ python train.py hparams/bnci2014009_atcnet.yaml --set train.seeds=[0,1,2]
 python train.py hparams/nakanishi2015_eegnet.yaml --baseline --out results.csv
 python summarize.py results/rtx4080super/*.csv                  # the table below, from its CSVs
 python train.py hparams/bnci2014001_eegnet.yaml --set data.subjects=[1] train.epochs=3 --device cpu   # smoke test
+python sweep.py hparams/lee2019mi_eegnet.yaml --out sweep.csv     # time and peak memory per pack size K
 ```
 
 `--baseline` trains every run a second time as a separate braindecode model,
 from the same initial weights and with the same data order, so packed and
-unpacked results can be compared run by run. `--out` writes one CSV row per
-run and method. The Lee2019 ERP and SSVEP recordings are about 100 GB and
-60 GB: [`cluster/drac`](cluster/drac) runs every recipe on a DRAC cluster.
+unpacked results can be compared run by run. `--out r.csv` writes one row per
+run and method, every run's training loss per epoch to `r-losses.csv`, its
+test logits to `r-logits.npz`, and the environment (GPU, library versions, git
+commit) to `r-env.json`; `--wandb PROJECT` also logs them to W&B. The Lee2019
+ERP and SSVEP recordings are about 100 GB and 60 GB:
+[`cluster/drac`](cluster/drac) runs every recipe on a DRAC cluster.
+
+`sweep.py` times a recipe's own training loop on its own data for pack sizes
+from 1 up to the largest that fits: peak memory is about linear in K, so it
+stops before a K predicted to fill more than 90% of the GPU.
 
 ### Results
 
@@ -265,8 +273,8 @@ prints the GPU and the torch, CUDA and cuDNN versions, and with `--repeats` the
 spread of the repeats, (max - min) / median.
 
 The results below come from a workstation that also drives a display.
-[`cluster/drac`](cluster/drac) runs the same benchmark on a dedicated
-headless GPU of a DRAC cluster, with 5 repeats and the environment recorded.
+[`cluster/drac`](cluster/drac) runs this benchmark, and `sweep.py` on every
+recipe, on H100 MIG slices of a DRAC cluster, with the environment recorded.
 
 ### RTX 4080 SUPER
 
