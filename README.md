@@ -150,66 +150,96 @@ with EEGNet's first block and uses the same spatial-first computation.
 
 ## Recipes
 
-Complete training and evaluation pipelines, one directory per dataset and
-protocol. Data loading and preprocessing use braindecode.
+[`recipes/moabb`](recipes/moabb) trains and evaluates the packed models on
+MOABB datasets, with one hparams file per dataset and model. Data loading and
+preprocessing use braindecode (`MOABBDataset`, band-pass, resampling,
+exponential moving standardization, `create_windows_from_events`), and the
+preprocessed trials are cached in `~/.cache/brainfold`.
 
-| recipe | dataset | paradigm | protocol | models |
-|---|---|---|---|---|
-| [`bnci2014001_loso`](recipes/bnci2014001_loso) | BNCI2014001 (BCI Competition IV 2a) | 4-class motor imagery | leave-one-session-out | EEGNet, ATCNet |
+| task | hparams | dataset | protocol | runs per seed | metrics |
+|---|---|---|---|---|---|
+| motor imagery | `bnci2014001_{eegnet,atcnet}` | BNCI2014001 (BCI Competition IV 2a): 9 subjects, 22 channels, 4 classes | cross-session | 18 | accuracy, kappa |
+| motor imagery | `lee2019mi_{eegnet,atcnet}` | Lee2019_MI (OpenBMI): 54 subjects, 62 channels, 2 classes | cross-session | 108 | accuracy, kappa |
+| P300 | `bnci2014009_{eegnet,atcnet}` | BNCI2014_009: 10 subjects, 16 channels, 1 target in 6 | cross-session | 30 | ROC AUC, balanced accuracy |
+| P300 | `lee2019erp_{eegnet,atcnet}` | Lee2019_ERP (OpenBMI): 54 subjects, 62 channels | cross-session | 108 | ROC AUC, balanced accuracy |
+| SSVEP | `nakanishi2015_{eegnet,atcnet}` | Nakanishi2015: 9 subjects, 8 channels, 12 classes | within-session, 5-fold | 45 | accuracy, kappa |
+| SSVEP | `lee2019ssvep_{eegnet,atcnet}` | Lee2019_SSVEP (OpenBMI): 54 subjects, 62 channels, 4 classes | cross-session | 108 | accuracy, kappa |
+
+The protocols are:
+
+- **cross-session:** per subject, test on each session and train on the others;
+- **cross-subject:** test on each subject and train on all the others;
+- **within-session:** per subject and session, stratified k-fold.
+
+Runs with equal training-set sizes are trained together, in packs of
+`train.pack_size`. The P300 recipes weight each member's loss by the inverse
+class frequencies of its own training set (`train.class_weight: balanced`).
+
+```bash
+cd recipes/moabb
+python train.py hparams/bnci2014001_eegnet.yaml                 # EEGNet, 300 epochs, seed 0
+python train.py hparams/bnci2014009_atcnet.yaml --set train.seeds=[0,1,2]
+python train.py hparams/nakanishi2015_eegnet.yaml --baseline --out results.csv
+python summarize.py results/rtx4080super/*.csv                  # the table below, from its CSVs
+python train.py hparams/bnci2014001_eegnet.yaml --set data.subjects=[1] train.epochs=3 --device cpu   # smoke test
+```
 
 `--baseline` trains every run a second time as a separate braindecode model,
 from the same initial weights and with the same data order, so packed and
-unpacked results can be compared run by run.
+unpacked results can be compared run by run. `--out` writes one CSV row per
+run and method. The Lee2019 ERP and SSVEP recordings are about 100 GB and
+60 GB: [`cluster/drac`](cluster/drac) runs every recipe on a DRAC cluster.
 
-### BNCI2014001, leave-one-session-out
+### Results
 
-9 subjects x 2 folds = 18 runs per seed, all trained as one pack.
-Preprocessing follows braindecode's BNCI2014001 tutorials (`MOABBDataset`,
-4-38 Hz band-pass, exponential moving standardization,
-`create_windows_from_events`). Hyperparameters are in `hparams.yaml` (EEGNet)
-and `hparams_atcnet.yaml` (ATCNet); override them with `--set`:
+On an RTX 4080 SUPER, packed and with `--baseline`, seeds 0, 1 and 2 (seed 0
+only for Lee2019_MI). Times are training and evaluation:
 
-```bash
-cd recipes/bnci2014001_loso
-python train.py                                  # EEGNet, 300 epochs, seed 0
-python train.py --hparams hparams_atcnet.yaml    # ATCNet, 500 epochs, seed 0
-python train.py --set train.seeds=[0,1,2]
-python train.py --baseline       # also train every run alone as a braindecode model
-python train.py --set data.subjects=[1] train.epochs=3 --device cpu   # smoke test
-```
+| task | dataset | model | runs | metric | packed | braindecode | packed - braindecode, per run | packed time | braindecode time | speedup |
+|---|---|---|---|---|---|---|---|---|---|---|
+| MI | Lee2019_MI | EEGNet | 108 | accuracy | 0.692 ± 0.150 | 0.695 ± 0.148 | -0.004 ± 0.040 | 64 s | 698 s | 11.0x |
+| MI | Lee2019_MI | ATCNet | 108 | accuracy | 0.675 ± 0.159 | 0.671 ± 0.162 | +0.004 ± 0.044 | 455 s | 4699 s | 10.3x |
+| P300 | BNCI2014_009 | EEGNet | 90 | roc auc | 0.948 ± 0.045 | 0.948 ± 0.045 | -0.000 ± 0.003 | 45 s | 299 s | 6.7x |
+| P300 | BNCI2014_009 | ATCNet | 90 | roc auc | 0.744 ± 0.078 | 0.745 ± 0.079 | -0.001 ± 0.018 | 114 s | 966 s | 8.5x |
+| SSVEP | Nakanishi2015 | EEGNet | 135 | accuracy | 0.842 ± 0.236 | 0.848 ± 0.228 | -0.007 ± 0.047 | 37 s | 215 s | 5.8x |
+| SSVEP | Nakanishi2015 | ATCNet | 135 | accuracy | 0.958 ± 0.102 | 0.958 ± 0.099 | +0.001 ± 0.032 | 293 s | 4130 s | 14.1x |
 
-**EEGNet** (`hparams.yaml`) resamples to 128 Hz (4 s trials, 512 samples).
-With seeds 0, 1, 2 (54 runs) on an RTX 4080 SUPER, training and evaluation:
+(± is the standard deviation over runs.) In every recipe, the packed and
+braindecode runs differ only in their dropout masks, so their per-run
+difference is noise around zero. Packing makes training and evaluation 5.8x
+to 14.1x faster.
+
+ATCNet was designed for motor imagery. On P300, the 0.8 s trials are shorter
+than it needs, so it shrinks its kernels, pools and windows, and it does much
+worse than EEGNet. These recipes show that packing gives the same results
+across tasks; they are not tuned for accuracy.
+
+**BNCI2014001 with ATCNet** uses ATCNet's defaults and the official code's
+training choices that keep members independent: 4.5 s trials at 250 Hz (from
+0.5 s before the cue, 1125 samples), max-norm on the conv kernels
+(`conv_max_norm_const: 0.6`) and its L2 weight decay
+(`PackedATCNet.source_optimizer_param_groups()`, as in braindecode's
+`ATCNet`). Unlike the official code, it uses braindecode's preprocessing, a
+cosine schedule over 500 epochs, and no model selection on the test session.
+The other ATCNet recipes use the same model and training. `PackedATCNet`
+implements `conv_max_norm_const` itself, but braindecode's `ATCNet` has it
+only from braindecode 1.7 (Python >= 3.11), so `--baseline` with the ATCNet
+recipes needs that version; on older braindecode, use
+`--set model.conv_max_norm_const=null`, which drops the constraint from both.
+
+**BNCI2014001**, seeds 0, 1 and 2 (54 runs), EEGNet:
 
 | | accuracy | kappa | time |
 |---|---|---|---|
 | PackedEEGNet, packs of 18 | 0.669 ± 0.165 | 0.559 ± 0.221 | 29 s |
 | braindecode EEGNet, one at a time | 0.670 ± 0.162 | 0.560 ± 0.216 | 131 s |
 
-(± is the standard deviation over runs.) The per-run accuracy difference is
--0.001 ± 0.038: the two differ only in their dropout masks.
-
-**ATCNet** (`hparams_atcnet.yaml`) uses ATCNet's defaults and the official
-code's training choices that keep members independent: 4.5 s trials at 250 Hz
-(from 0.5 s before the cue, 1125 samples), max-norm on the conv kernels
-(`conv_max_norm_const: 0.6`) and its L2 weight decay
-(`PackedATCNet.source_optimizer_param_groups()`, as in braindecode's
-`ATCNet`). Unlike the official code, it uses braindecode's preprocessing, a
-cosine schedule over 500 epochs, and no model selection on the test session.
-`PackedATCNet` implements `conv_max_norm_const` itself, but braindecode's
-`ATCNet` has it only from braindecode 1.7 (Python >= 3.11), so `--baseline`
-with `hparams_atcnet.yaml` needs that version; on older braindecode, use
-`--set model.conv_max_norm_const=null`, which drops the constraint from both.
-
-With seeds 0, 1, 2 (54 runs), on the same GPU:
+ATCNet:
 
 | | accuracy | kappa | time |
 |---|---|---|---|
 | PackedATCNet, packs of 18 | 0.687 ± 0.152 | 0.583 ± 0.202 | 279 s |
 | braindecode ATCNet, one at a time | 0.691 ± 0.146 | 0.588 ± 0.194 | 2926 s |
-
-The per-run accuracy difference is -0.003 ± 0.031, again from dropout masks
-alone; the packed runs take 10.5x less time.
 
 ## Benchmarks
 
@@ -226,10 +256,17 @@ for three ways of training K models:
 python benchmarks/bench_packing.py                   # EEGNet, 4608 trials
 python benchmarks/bench_packing.py --n-trials 288
 python benchmarks/bench_packing.py --model atcnet
+python benchmarks/bench_packing.py --repeats 5 --out eegnet.csv   # median of 5, every repeat to a CSV
 ```
 
 4608 trials is a leave-one-subject-out training set and 288 a
-leave-one-session-out one. The script currently times CUDA devices only.
+leave-one-session-out one. The script currently times CUDA devices only. It
+prints the GPU and the torch, CUDA and cuDNN versions, and with `--repeats` the
+spread of the repeats, (max - min) / median.
+
+The results below come from a workstation that also drives a display.
+[`cluster/drac`](cluster/drac) runs the same benchmark on a dedicated
+headless GPU of a DRAC cluster, with 5 repeats and the environment recorded.
 
 ### RTX 4080 SUPER
 
@@ -255,9 +292,9 @@ hardware will show.
 
 ### Contributing results
 
-Results from other GPUs are welcome. Run the three commands above and open a
-pull request adding a section for your hardware, with the GPU, driver, CUDA,
-PyTorch and braindecode versions.
+Results from other GPUs are welcome. Run the commands above with
+`--repeats 5 --out ...` and open a pull request adding a section for your
+hardware, with the GPU, driver, CUDA, PyTorch and braindecode versions.
 
 ## Why not torch.func?
 
@@ -396,6 +433,21 @@ brainfold is for EEG decoding only. It is growing in three directions:
 - **Datasets:** more recipes, covering more datasets, paradigms and evaluation
   protocols.
 - **Models:** more braindecode architectures.
+
+Backlog:
+
+- **Per-member hyperparameters.** Adam and coupled weight decay act element by
+  element, so the learning rate and the weight decay could be per-member
+  tensors without coupling the members, and so could the dropout rate, as a
+  per-group mask. One pack could then train a grid of hyperparameters. The
+  natural grouping is still a single configuration over many seeds, sessions or
+  subjects, which lowers the variance of its validation estimate; a grid would
+  multiply the members needed.
+- **Pruning finished members.** For early stopping, `subset(members)` would
+  return a smaller pack, with the matching slices of the optimizer state.
+  Freezing a member in place is not enough: Adam keeps moving it through its
+  momentum and weight decay, and BatchNorm keeps updating its running
+  statistics.
 
 ## Adding a model
 
