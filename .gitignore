@@ -3,3 +3,6 @@ __pycache__/
 .venv/
 .pytest_cache/
 *.zip
+.agents/
+.claude/
+skills-lock.json
