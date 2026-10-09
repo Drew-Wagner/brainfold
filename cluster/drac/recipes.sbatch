@@ -1,16 +1,20 @@
 #!/bin/bash
 # One recipe configuration and seed per array task, on one MIG slice; seed 0
 # also trains the braindecode baseline. Run prepare.sbatch first.
-#   sbatch --account=def-yourpi --gpus=nvidia_h100_80gb_hbm3_2g.20gb:1 --array=0-23,30-35 cluster/drac/recipes.sbatch
-#   sbatch --account=def-yourpi --gpus=nvidia_h100_80gb_hbm3_3g.40gb:1 --array=24-29 cluster/drac/recipes.sbatch  # Lee2019_ERP
+#   sbatch --account=def-yourpi --gpus=nvidia_h100_80gb_hbm3_2g.20gb:1 --array=0-8,12-23 cluster/drac/recipes.sbatch
+#   sbatch --account=def-yourpi --gpus=nvidia_h100_80gb_hbm3_2g.20gb:1 --time=4:00:00 --array=9-11 cluster/drac/recipes.sbatch  # Lee2019_MI ATCNet
+#   sbatch --account=def-yourpi --gpus=nvidia_h100_80gb_hbm3_2g.20gb:1 --time=12:00:00 --array=30-35 cluster/drac/recipes.sbatch  # Lee2019_SSVEP
+#   sbatch --account=def-yourpi --gpus=nvidia_h100_80gb_hbm3_3g.40gb:1 --time=12:00:00 --array=24-29 cluster/drac/recipes.sbatch  # Lee2019_ERP
 # Array index i runs CONFIGS[i / 3] from env.sh with seed i % 3. Extra
 # arguments go to train.py and apply to every task; set each configuration's
 # train.pack_size in its hparams file.
+# On a 2g.20gb slice, seed 0 (with the baseline) took at most 37 min, except
+# Lee2019_MI ATCNet at 2 h 26 min; Lee2019_ERP and Lee2019_SSVEP are untimed.
 #SBATCH --job-name=brainfold-recipes
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=32G
-#SBATCH --time=12:00:00
+#SBATCH --time=1:00:00
 #SBATCH --output=%x-%A_%a.out
 set -euo pipefail
 source "$SLURM_SUBMIT_DIR/cluster/drac/env.sh"

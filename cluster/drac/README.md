@@ -25,8 +25,10 @@ sbatch --account=def-yourpi --gpus=nvidia_h100_80gb_hbm3_1g.10gb:1 --array=0-11 
 # 4. Set train.pack_size in each recipes/moabb/hparams/<config>.yaml from the sweep, then run every
 #    recipe and seed (array index = 3 x configuration + seed). Lee2019_ERP's data takes about 14 GB,
 #    so it needs 3g.40gb.
-sbatch --account=def-yourpi --gpus=nvidia_h100_80gb_hbm3_2g.20gb:1 --array=0-23,30-35 cluster/drac/recipes.sbatch
-sbatch --account=def-yourpi --gpus=nvidia_h100_80gb_hbm3_3g.40gb:1 --array=24-29 cluster/drac/recipes.sbatch
+sbatch --account=def-yourpi --gpus=nvidia_h100_80gb_hbm3_2g.20gb:1 --array=0-8,12-23 cluster/drac/recipes.sbatch
+sbatch --account=def-yourpi --gpus=nvidia_h100_80gb_hbm3_2g.20gb:1 --time=4:00:00 --array=9-11 cluster/drac/recipes.sbatch
+sbatch --account=def-yourpi --gpus=nvidia_h100_80gb_hbm3_2g.20gb:1 --time=12:00:00 --array=30-35 cluster/drac/recipes.sbatch
+sbatch --account=def-yourpi --gpus=nvidia_h100_80gb_hbm3_3g.40gb:1 --time=12:00:00 --array=24-29 cluster/drac/recipes.sbatch
 
 # 5. On a login node: upload the offline W&B runs.
 wandb sync $BRAINFOLD_DATA/results/wandb/offline-run-*
@@ -57,8 +59,9 @@ interactively (`salloc --account=def-yourpi --gpus=nvidia_h100_80gb_hbm3_1g.10gb
 - **GPU names:** the MIG profiles above are Fir's and Nibi's; list a cluster's
   with `sinfo -o "%G"`. `nvidia-smi -L` in the job should show the MIG device.
 - **A short run:** `python recipes/moabb/sweep.py hparams/bnci2014001_eegnet.yaml --max-pack-size 4`.
-- **Time limits:** `recipes.sbatch` asks for 12 h. The Lee2019 configurations
-  with ATCNet take the longest, because seed 0 also trains 108 braindecode
-  models one at a time.
+- **Time limits:** `recipes.sbatch` asks for 1 h. On a 2g.20gb slice, seed 0,
+  which also trains a braindecode model per run, took at most 37 min, except
+  Lee2019_MI with ATCNet (108 runs) at 2 h 26 min, so it gets 4 h. Lee2019_ERP
+  and Lee2019_SSVEP are not timed yet and get 12 h; ask for less once they are.
 - **Licenses:** some MOABB datasets ask you to accept their terms on first
   download. If `download.py` stops on one, accept it and run `setup.sh` again.
