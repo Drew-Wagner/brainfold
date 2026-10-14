@@ -73,7 +73,8 @@ def main():
     shape = dict(n_chans=X.shape[1], n_outputs=n_classes, n_times=X.shape[2])
     settings = dict(lr=train["lr"], batch_size=train["batch_size"], weight_decay=train.get("weight_decay"),
                     class_weight=train.get("class_weight"), autocast_dtype=precision_settings(args),
-                    optimizer=args.optimizer, warmup_epochs=args.warmup_epochs)
+                    optimizer=args.optimizer, warmup_epochs=args.warmup_epochs,
+                    recalibrate_bn=args.recalibrate_bn)
     common = dict(config=Path(args.hparams).stem, dataset=data["dataset"], architecture=architecture,
                   n_train=len(train_idx), batch_size=train["batch_size"], data_bytes=X.nbytes, gpu_memory=total,
                   **shape)

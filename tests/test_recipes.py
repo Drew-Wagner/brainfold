@@ -63,13 +63,15 @@ def no_dropout(model):
     return model
 
 
+@pytest.mark.parametrize("optimizer", [dict(optimizer="schedule-free"), dict(optimizer="adam", recalibrate_bn=True)],
+                         ids=["schedule-free", "adam-recalibrate-bn"])
 @pytest.mark.parametrize("cls, kwargs, weight_decay", [
     (PackedEEGNet, dict(n_times=129, F1=4), None),
     (PackedATCNet, dict(n_times=257, conv_block_n_filters=4, conv_block_pool_size_1=4, conv_block_pool_size_2=4,
                         conv_max_norm_const=0.6), dict(conv=0.009, dense=0.5)),
 ])
-def test_schedule_free_pack_equals_members(cls, kwargs, weight_decay):
-    """Schedule-free AdamW (warmup, L2, BatchNorm recalibration) on a pack == on each member alone,
+def test_pack_equals_members(cls, kwargs, weight_decay, optimizer):
+    """Schedule-free AdamW, or Adam, with warmup, L2 and BatchNorm recalibration, on a pack == on each member alone,
     and evaluating every epoch changes nothing."""
     g = torch.Generator().manual_seed(0)
     X = torch.randn(40, 8, kwargs["n_times"], generator=g, dtype=torch.float64) + 0.3
@@ -78,8 +80,8 @@ def test_schedule_free_pack_equals_members(cls, kwargs, weight_decay):
     seeds = [0, 1, 2]
     model = no_dropout(cls.from_seeds(seeds, n_chans=8, n_outputs=3, **kwargs).double())
     members = [no_dropout(PackOfOne(m)) for m in model.to_braindecode()]
-    settings = dict(epochs=3, lr=1e-2, batch_size=10, weight_decay=weight_decay, optimizer="schedule-free",
-                    warmup_epochs=1)
+    settings = dict(epochs=3, lr=1e-2, batch_size=10, weight_decay=weight_decay, warmup_epochs=1,
+                    **optimizer)
     evaluated = []
     _, losses = fit(model, X, y, train_idx, seeds, eval_every=1,
                     on_eval=lambda epoch, m: evaluated.append(predict(m, X, train_idx)), **settings)

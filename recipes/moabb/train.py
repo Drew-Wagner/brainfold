@@ -112,7 +112,8 @@ def load_cached(data, cache_dir):
 
 
 def fit(model, X, y, train_idx, seeds, epochs, lr, batch_size, weight_decay=None, class_weight=None,
-        compile=False, autocast_dtype=None, optimizer="adam", warmup_epochs=0, eval_every=None, on_eval=None):
+        compile=False, autocast_dtype=None, optimizer="adam", warmup_epochs=0, recalibrate_bn=False,
+        eval_every=None, on_eval=None):
     """Train every member with Adam and a cosine learning-rate schedule, or schedule-free AdamW.
 
     ``model`` maps (batch, K, n_chans, n_times) to (batch, K, n_outputs). Member k
@@ -132,6 +133,9 @@ def fit(model, X, y, train_idx, seeds, epochs, lr, batch_size, weight_decay=None
     while gradients are taken elsewhere, so the BatchNorm statistics are
     recomputed for x on the training set (see ``recalibrate_batch_norms``).
     ``warmup_epochs`` warms the learning rate up linearly, per step, for either.
+    ``recalibrate_bn`` recomputes the BatchNorm statistics with Adam too, before
+    every evaluation: their running averages (momentum 0.01 in EEGNet) lag the
+    weights by about 100 steps.
 
     ``on_eval(epoch, model)`` is called, model ready to evaluate, after every
     ``eval_every`` epochs but the last; training continues unchanged after it.
@@ -186,17 +190,21 @@ def fit(model, X, y, train_idx, seeds, epochs, lr, batch_size, weight_decay=None
         recalibrate_batch_norms(model, lambda: (logits(positions[:, i : i + batch_size], model)
                                                 for i in range(0, n_train, batch_size)))
 
+    recalibrate_bn = recalibrate_bn or optimizer == "schedule-free"
+
     def evaluate(epoch):
         buffers = None
-        if optimizer == "schedule-free":
-            opt.eval()  # the parameters become x
+        if recalibrate_bn:
+            if optimizer == "schedule-free":
+                opt.eval()  # the parameters become x
             buffers = [b.clone() for b in model.buffers()]
             recalibrate()
         on_eval(epoch, model)
         if buffers is not None:
             for b, saved in zip(model.buffers(), buffers):
                 b.copy_(saved)
-            opt.train()
+            if optimizer == "schedule-free":
+                opt.train()
 
     epoch_losses = torch.zeros(epochs, len(seeds), device=train_idx.device)  # read once at the end: no sync per step
     step = 0
@@ -228,6 +236,7 @@ def fit(model, X, y, train_idx, seeds, epochs, lr, batch_size, weight_decay=None
             evaluate(epoch + 1)
     if optimizer == "schedule-free":
         opt.eval()
+    if recalibrate_bn:
         recalibrate()
     return model, epoch_losses.cpu()
 
@@ -358,6 +367,9 @@ def add_common_arguments(parser):
                         help="adam: cosine-annealed (the recipes'); schedule-free: AdamW at a constant lr "
                              "(Defazio et al., 2024), e.g. with --set train.lr=0.0025")
     parser.add_argument("--warmup-epochs", type=float, default=0, help="linear learning-rate warmup")
+    parser.add_argument("--recalibrate-bn", action="store_true",
+                        help="with adam, recompute the BatchNorm statistics on the training set before evaluating "
+                             "(schedule-free always does)")
 
 
 def precision_settings(args):
@@ -478,7 +490,8 @@ def main():
     settings = dict(epochs=train["epochs"], lr=train["lr"], batch_size=train["batch_size"],
                     weight_decay=train.get("weight_decay"), class_weight=train.get("class_weight"),
                     autocast_dtype=precision_settings(args), optimizer=args.optimizer,
-                    warmup_epochs=args.warmup_epochs, eval_every=args.eval_every)
+                    warmup_epochs=args.warmup_epochs, recalibrate_bn=args.recalibrate_bn,
+                    eval_every=args.eval_every)
     rows, losses, logits, curves, seconds = [], [], [], [], dict.fromkeys(methods, 0.0)
     warmed = set()  # (method, members per model, training size, test size) that cudnn.benchmark has seen
     for pack_index, pack in enumerate(packs(runs, train["pack_size"])):
