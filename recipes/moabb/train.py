@@ -144,9 +144,11 @@ def fit(model, X, y, train_idx, seeds, epochs, lr, batch_size, weight_decay=None
     moments = None
     if hasattr(model, "input_moments"):
         trials, train_pos = train_idx.unique(return_inverse=True)
-        chunks = [model.input_moments(X[trials[i : i + 1024]].to(dtype)) for i in range(0, len(trials), 1024)]
+        chunks = [model.input_moments(X[trials[i : i + 256]].to(dtype)) for i in range(0, len(trials), 256)]
         moments = tuple(torch.cat(parts) for parts in zip(*chunks))
-    forward = torch.compile(model) if compile else model  # shares model's parameters
+    # Shares model's parameters. Static shapes, one graph per batch size (the last batch is smaller): with
+    # dynamic batch sizes, Inductor's backward asserted the full batch's strides on Lee2019_MI (torch 2.14)
+    forward = torch.compile(model, dynamic=False) if compile else model
     epoch_losses = torch.zeros(epochs, len(seeds), device=train_idx.device)  # read once at the end: no sync per step
     for epoch in range(epochs):
         for group in optimizer.param_groups:

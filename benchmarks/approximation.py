@@ -73,7 +73,7 @@ def relative(a, b):
 def one_step(model, x, y, moments, compile, autocast_dtype):
     """Training logits and gradients of the summed member losses on one batch."""
     model = copy.deepcopy(model).train()
-    forward = torch.compile(model) if compile else model
+    forward = torch.compile(model, dynamic=False) if compile else model
     with torch.autocast(x.device.type, autocast_dtype, enabled=autocast_dtype is not None):
         logits = forward(x, moments) if moments is not None else forward(x)
     F.cross_entropy(logits.float().permute(0, 2, 1), y, reduction="none").mean(0).sum().backward()

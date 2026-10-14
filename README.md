@@ -204,6 +204,80 @@ ERP and SSVEP recordings are about 100 GB and 60 GB:
 from 1 up to the largest that fits: peak memory is about linear in K, so it
 stops before a K predicted to fill more than 90% of the GPU.
 
+### Speed options
+
+The recipes compute the first BatchNorm's input moments once per training trial
+(`input_moments`, exact). Against recomputing them every step, that made whole
+recipes 1.17x (BNCI2014001 ATCNet), 1.28x (BNCI2014001 EEGNet), 1.34x
+(Lee2019_MI ATCNet) and 1.64x (Lee2019_MI EEGNet) faster on the RTX 4080
+SUPER, for n_trials x L^2 x 4 bytes of memory (L the first conv's length:
+0.1-0.3 GiB here).
+
+`train.py` and `sweep.py` take three options that trade exactness for speed or
+memory. All are off by default:
+
+- `--compile` trains the packed model through `torch.compile`, which fuses the
+  elementwise chains at full time resolution. Dropout then draws its masks from
+  Inductor's generator, so masks differ from eager mode.
+- `--precision bf16` runs the model under bf16 autocast, with TF32 matmuls (or
+  `tf32` for TF32 matmuls alone). The first BatchNorm's statistics stay in
+  float32: `var = E[u^2] - mu^2` would lose too much in bf16.
+- `--data-dtype float16` keeps the trials on the GPU in float16 and converts
+  each batch, which halves the data's memory (6 GB for Lee2019_MI ATCNet).
+
+Every option keeps the members independent. `benchmarks/approximation.py`
+measures each option's numerical error against float64 on a recipe's own data,
+with dropout off. After 20 epochs of BNCI2014001, the test predictions that
+differ from float64's are:
+
+| | EEGNet | ATCNet |
+|---|---|---|
+| float32 (the default) | 0.02-0.17% | 0.02-0.06% |
+| `--compile`, `--precision tf32` or `--data-dtype float16` | 0.06-0.14% | 0.02-0.04% |
+| `--precision bf16`, alone or with the others | 0.35% | 0.48-0.73% |
+
+The float32 range is its own run-to-run spread (cuDNN is not deterministic), so
+only bf16 is distinguishable from it. One bf16 step has about 1% relative error
+in the logits and gradients, against 0.03-0.09% for float32.
+
+Full recipe runs, with dropout, on the RTX 4080 SUPER, against the default
+(float32), per run:
+
+| recipe | runs | option | accuracy | difference per run | time (train + eval) | speedup |
+|---|---|---|---|---|---|---|
+| BNCI2014001 EEGNet | 54 | float32 | 0.669 ± 0.167 | | 26.9 s | 1.00x |
+| | | float32 again | 0.669 ± 0.167 | +0.000 ± 0.001 | 26.6 s | 1.01x |
+| | | `--compile` | 0.670 ± 0.164 | +0.001 ± 0.037 | 23.3 s | 1.15x |
+| | | `--precision bf16` | 0.668 ± 0.166 | -0.002 ± 0.031 | 24.8 s | 1.08x |
+| | | all three | 0.669 ± 0.166 | -0.000 ± 0.037 | 20.1 s | 1.34x |
+| Lee2019_MI EEGNet | 108 | float32 | 0.696 ± 0.146 | | 45.4 s | 1.00x |
+| | | float32 again | 0.696 ± 0.146 | +0.000 ± 0.000 | 44.6 s | 1.02x |
+| | | `--compile` | 0.694 ± 0.148 | -0.001 ± 0.044 | 37.4 s | 1.21x |
+| | | `--precision bf16` | 0.699 ± 0.144 | +0.004 ± 0.032 | 41.2 s | 1.10x |
+| | | all three | 0.695 ± 0.148 | -0.001 ± 0.043 | 39.7 s | 1.14x |
+| BNCI2014001 ATCNet | 54 | float32 | 0.688 ± 0.152 | | 274.5 s | 1.00x |
+| | | float32 again | 0.687 ± 0.152 | -0.001 ± 0.004 | 281.6 s | 0.97x |
+| | | `--compile` | 0.692 ± 0.144 | +0.005 ± 0.033 | 192.4 s | 1.43x |
+| | | `--precision bf16` | 0.694 ± 0.149 | +0.006 ± 0.032 | 164.1 s | 1.67x |
+| | | all three | 0.694 ± 0.143 | +0.006 ± 0.031 | 123.2 s | 2.23x |
+| Lee2019_MI ATCNet | 108 | float32 | 0.676 ± 0.159 | | 310.0 s | 1.00x |
+| | | `--compile` | 0.675 ± 0.162 | -0.002 ± 0.041 | 274.2 s | 1.13x |
+| | | `--precision bf16` | 0.673 ± 0.161 | -0.004 ± 0.035 | 317.0 s | 0.98x |
+| | | all three | 0.675 ± 0.160 | -0.002 ± 0.040 | 251.4 s | 1.23x |
+
+Peak memory falls with every option: Lee2019_MI ATCNet (K=36) uses 9.5 GiB in
+float32 and 5.1 GiB with all three, 3 GiB of it from float16 data. The
+speedups depend on the recipe: bf16 alone is 1.67x on BNCI2014001 ATCNet but
+0.98x on Lee2019_MI ATCNet, so time an option on a recipe before relying on it.
+
+Rerunning float32 changes a run by at most 0.014. Each option changes runs by
+about ±0.03-0.04, as much as different dropout masks do (packed against
+braindecode in [Results](#results)), and the mean by at most 0.006, under 1.5
+standard errors. So the options change which run lands where, not the
+distribution of results. Use them for sweeps and exploration. For
+comparisons that need matching runs, use float32, which is also what the
+`--baseline` braindecode models are compared against.
+
 ### Results
 
 On an RTX 4080 SUPER, packed and with `--baseline`, seeds 0, 1 and 2 (seed 0
