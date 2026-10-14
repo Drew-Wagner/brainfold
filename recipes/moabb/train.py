@@ -134,6 +134,12 @@ def fit(model, X, y, train_idx, seeds, epochs, lr, batch_size, weight_decay=None
     elif class_weight is not None:
         raise ValueError(f"unknown class_weight {class_weight!r}")
     members = torch.arange(len(seeds), device=train_idx.device)
+    # The first BatchNorm's input moments, once per training trial instead of every step;
+    # train_pos[k, i] is train_idx[k, i]'s row in them
+    moments = None
+    if hasattr(model, "input_moments"):
+        trials, train_pos = train_idx.unique(return_inverse=True)
+        moments = model.input_moments(X[trials])
     epoch_losses = torch.zeros(epochs, len(seeds), device=train_idx.device)  # read once at the end: no sync per step
     for epoch in range(epochs):
         for group in optimizer.param_groups:
@@ -142,7 +148,12 @@ def fit(model, X, y, train_idx, seeds, epochs, lr, batch_size, weight_decay=None
         order = torch.stack([torch.randperm(n_train, device=train_idx.device, generator=g) for g in generators])
         for i in range(0, n_train, batch_size):
             idx = train_idx.gather(1, order[:, i : i + batch_size]).T  # (batch, K)
-            losses = F.cross_entropy(model(X[idx]).permute(0, 2, 1), y[idx], reduction="none")
+            if moments is None:
+                logits = model(X[idx])
+            else:
+                pos = train_pos.gather(1, order[:, i : i + batch_size]).T
+                logits = model(X[idx], tuple(m[pos] for m in moments))
+            losses = F.cross_entropy(logits.permute(0, 2, 1), y[idx], reduction="none")
             if class_weight is None:
                 losses = losses.mean(0)
             else:

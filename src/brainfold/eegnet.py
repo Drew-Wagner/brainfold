@@ -149,8 +149,9 @@ class PackedEEGNet(PackedModel):
         self.classifier = nn.Conv1d(K * F2, K * n_outputs, n_final, groups=K)
         nn.init.zeros_(self.classifier.bias)
 
-    def forward(self, x: Tensor) -> Tensor:
-        h = self._first_block(x)  # (batch, K * F1 * D, time)
+    def forward(self, x: Tensor, moments: tuple[Tensor, Tensor] | None = None) -> Tensor:
+        """x (batch, K, n_chans, n_times) -> (batch, K, n_outputs); ``moments``: see ``input_moments``."""
+        h = self._first_block(x, moments)  # (batch, K * F1 * D, time)
         h = self.drop(self.pool(self.act(self.bn1(h)), self.pool1_kernel_size))
         h = self.bn2(self.sep_point(self.sep_depth(h)))
         h = self.drop(self.pool(self.act(h), self.pool2_kernel_size))
@@ -160,12 +161,15 @@ class PackedEEGNet(PackedModel):
         out = F.conv1d(h, weight, self.classifier.bias, groups=self.n_models)
         return out.view(len(x), self.n_models, self.n_outputs)
 
-    def _first_block(self, x: Tensor) -> Tensor:
+    def _first_block(self, x: Tensor, moments: tuple[Tensor, Tensor] | None = None) -> Tensor:
         """spatial(BN(temporal(x))) computed spatial-first; x is (batch, K, C, T)."""
         s = self.spatial_weight.renorm(2, 0, self.conv_spatial_max_norm)
-        P = self.kernel_length // 2
         return spatial_first_block(x, self.temporal_weight, s.view(self.n_models, -1, self.n_chans),
-                                   self.bn_temporal, (P, P))
+                                   self.bn_temporal, self._first_block_conv()[1], moments)
+
+    def _first_block_conv(self):
+        P = self.kernel_length // 2
+        return self.kernel_length, (P, P)
 
     # ---- conversion to and from K separate braindecode EEGNets --------------------
 

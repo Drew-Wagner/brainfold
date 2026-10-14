@@ -91,6 +91,11 @@ def inputs(n_times, seed=0, dtype=torch.float64, batch=8):
     return x.to(dtype), torch.randint(N_OUT, (batch, K), generator=g)
 
 
+def moments(packed, x):
+    """x's per-trial moments from ``input_moments``, shaped (batch, K, ...) like x."""
+    return tuple(m.view(*x.shape[:2], *m.shape[1:]) for m in packed.input_moments(x.flatten(0, 1), chunk_size=5))
+
+
 def assert_same_state(packed, models):
     for state, model in zip(packed.to_state_dicts(), models):
         assert state.keys() == model.state_dict().keys()
@@ -112,8 +117,9 @@ def test_forward_and_running_stats(n_times, config, train):
     assert_same_state(packed, models)
 
 
+@pytest.mark.parametrize("precomputed", [False, True], ids=["", "precomputed-moments"])
 @pytest.mark.parametrize("n_times, config", CONFIGS)
-def test_adam_training(n_times, config):
+def test_adam_training(n_times, config, precomputed):
     models = members(n_times, **config)
     packed = pack(models)
     optimizers = [torch.optim.Adam(m.parameters(), lr=1e-2) for m in models]
@@ -125,7 +131,8 @@ def test_adam_training(n_times, config):
             torch.nn.functional.cross_entropy(atcnet_forward(model, x[:, k]), y[:, k]).backward()
             optimizer.step()
         packed_optimizer.zero_grad()
-        losses = torch.nn.functional.cross_entropy(packed(x).permute(0, 2, 1), y, reduction="none").mean(0)
+        losses = torch.nn.functional.cross_entropy(packed(x, moments(packed, x) if precomputed else None)
+                                                   .permute(0, 2, 1), y, reduction="none").mean(0)
         losses.sum().backward()  # sum of member mean losses: each member gets its own gradient
         packed_optimizer.step()
     assert_same_state(packed, models)

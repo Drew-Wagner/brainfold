@@ -102,6 +102,26 @@ class PackedModel(nn.Module):
         packed.load_state_dicts([model.state_dict() for model in models])
         return packed.train(models[0].training)
 
+    def _first_block_conv(self) -> tuple[int, tuple[int, int]]:
+        """(length, (left, right) padding) of the first block's temporal conv."""
+        raise NotImplementedError
+
+    @torch.no_grad()
+    def input_moments(self, x: Tensor, chunk_size: int = 256) -> tuple[Tensor, Tensor]:
+        """Per-trial input moments for the first block's BatchNorm, to pass to ``forward``.
+
+        For trials x (n, n_chans, n_times), returns each trial's window means (n, L)
+        and lag second moments (n, L, L) (see ``_lag_moments``). In training, the
+        first BatchNorm's batch statistics are the batch's mean of these, so
+        ``model(x[idx], moments=tuple(m[idx] for m in moments))`` equals
+        ``model(x[idx])`` without recomputing them every step. They depend only on
+        the input, so compute them once per dataset (no augmentation).
+        """
+        L, padding = self._first_block_conv()
+        parts = [_lag_moments(F.pad(x[i : i + chunk_size], padding)[None], L)
+                 for i in range(0, len(x), chunk_size)]
+        return torch.cat([e for e, _ in parts]), torch.cat([M for _, M in parts])
+
     def to_braindecode(self) -> list:
         """The members as separate braindecode models (copies)."""
         import braindecode.models
@@ -116,12 +136,15 @@ class PackedModel(nn.Module):
         return models
 
 
-def spatial_first_block(x: Tensor, w: Tensor, s: Tensor, bn: nn.BatchNorm1d, padding: tuple[int, int]) -> Tensor:
+def spatial_first_block(x: Tensor, w: Tensor, s: Tensor, bn: nn.BatchNorm1d, padding: tuple[int, int],
+                        moments: tuple[Tensor, Tensor] | None = None) -> Tensor:
     """spatial(BN(temporal(x))) computed spatial-first (see eegnet.py's docstring).
 
     x is (batch, K, C, T); w (K * F1, L) the temporal filters, padded by ``padding``
     (left, right); s (K, F1 * D, C) the spatial filters, filter g reading temporal
     filter g // D; ``bn`` the BatchNorm1d(K * F1) after the temporal conv.
+    ``moments``, optional, are x's per-trial moments from ``PackedModel.input_moments``,
+    (batch, K, L) and (batch, K, L, L); without them, training computes them from x.
     Returns (batch, K * F1 * D, T + left + right - L + 1).
     """
     B, K, C, T = x.shape
@@ -130,10 +153,15 @@ def spatial_first_block(x: Tensor, w: Tensor, s: Tensor, bn: nn.BatchNorm1d, pad
     D = s.shape[1] // F1
 
     if bn.training:
-        e, M = _lag_moments(F.pad(x, padding), L)  # (K, L), (K, L, L); no gradient needed
-        w_k = w.view(K, F1, L)
-        mean = torch.einsum("kfl,kl->kf", w_k, e).reshape(-1)
-        var = torch.einsum("kfl,klm,kfm->kf", w_k, M, w_k).reshape(-1) - mean**2
+        # In the parameters' precision even under autocast: var = E[u^2] - mu^2 cancels digits
+        with torch.autocast(x.device.type, enabled=False):
+            if moments is None:
+                e, M = _lag_moments(F.pad(x.to(w.dtype), padding), L)  # (K, L), (K, L, L); no gradient needed
+            else:  # every trial has B * T_out positions, so the batch's moments are the mean of the trials'
+                e, M = moments[0].to(w.dtype).mean(0), moments[1].to(w.dtype).mean(0)
+            w_k = w.view(K, F1, L)
+            mean = torch.einsum("kfl,kl->kf", w_k, e).reshape(-1)
+            var = torch.einsum("kfl,klm,kfm->kf", w_k, M, w_k).reshape(-1) - mean**2
         with torch.no_grad():  # same running-stat update as nn.BatchNorm
             n = B * C * (T + sum(padding) - L + 1)
             bn.num_batches_tracked.add_(1)

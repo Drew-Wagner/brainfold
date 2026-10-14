@@ -90,6 +90,11 @@ Every packed model has the same interface:
   do all members.
 - **braindecode.** `model.to_braindecode()` returns K ordinary braindecode
   models, and `PackedX.from_braindecode(models)` packs existing ones.
+- **Precomputed input moments.** In training, the first BatchNorm's
+  statistics come from moments of the input (see [How it works](#how-it-works)).
+  `moments = model.input_moments(X)` computes them once per trial, and
+  `model(X[idx], tuple(m[idx] for m in moments))` gives the same result as
+  `model(X[idx])` without recomputing them every step. The recipes do this.
 
 For example, per-member early stopping:
 
@@ -413,7 +418,10 @@ mu_f = w_f . e,    E[u_f^2] = w_f^T M w_f,    var_f = E[u_f^2] - mu_f^2
 Here `e` (length L) and `M` (L x L) are the window means and lag second moments
 of the zero-padded input. `M` comes from the FFT autocorrelation of the input,
 minus the products each window leaves out at the two edges, read off small
-Gram matrices of the edge samples. Neither needs gradients. Gradients reach
+Gram matrices of the edge samples. Neither needs gradients. Both are means of
+per-trial moments, so for a fixed dataset they can be computed once per trial
+(`input_moments`) and averaged over each batch, instead of computed with FFTs
+over every batch. Gradients reach
 w, gamma, beta and s through `mu_f` and `var_f` exactly as through the original
 BatchNorm, and the running statistics are updated the same way.
 

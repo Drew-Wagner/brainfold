@@ -41,6 +41,11 @@ def inputs(seed=0, dtype=torch.float64, batch=8):
     return x.to(dtype), torch.randint(N_OUT, (batch, K), generator=g)
 
 
+def moments(packed, x):
+    """x's per-trial moments from ``input_moments``, shaped (batch, K, ...) like x."""
+    return tuple(m.view(*x.shape[:2], *m.shape[1:]) for m in packed.input_moments(x.flatten(0, 1), chunk_size=5))
+
+
 CONFIGS = [
     dict(),
     dict(F1=4, D=2),
@@ -66,8 +71,9 @@ def test_forward_and_running_stats(config, train):
             torch.testing.assert_close(state[key], value, msg=key)
 
 
+@pytest.mark.parametrize("precomputed", [False, True], ids=["", "precomputed-moments"])
 @pytest.mark.parametrize("config", CONFIGS)
-def test_adam_training(config):
+def test_adam_training(config, precomputed):
     models = members(**config)
     packed = PackedEEGNet.from_braindecode(models)
     optimizers = [torch.optim.Adam(m.parameters(), lr=1e-2) for m in models]
@@ -79,7 +85,8 @@ def test_adam_training(config):
             torch.nn.functional.cross_entropy(model(x[:, k]), y[:, k]).backward()
             optimizer.step()
         packed_optimizer.zero_grad()
-        losses = torch.nn.functional.cross_entropy(packed(x).permute(0, 2, 1), y, reduction="none").mean(0)
+        losses = torch.nn.functional.cross_entropy(packed(x, moments(packed, x) if precomputed else None)
+                                                   .permute(0, 2, 1), y, reduction="none").mean(0)
         losses.sum().backward()  # sum of member mean losses: each member gets its own gradient
         packed_optimizer.step()
     for state, model in zip(packed.to_state_dicts(), models):
@@ -153,3 +160,17 @@ def test_braindecode_signal_arguments():
 def test_unsupported_options_raise(kwargs):
     with pytest.raises(ValueError):
         PackedEEGNet(K, C, N_OUT, T, **kwargs)
+
+
+@pytest.mark.parametrize("precomputed", [False, True], ids=["", "precomputed-moments"])
+def test_bf16_autocast(precomputed):
+    """Under bf16 autocast the first BatchNorm's statistics stay in float32, close to float32 training."""
+    models = members(torch.float32)
+    x, _ = inputs(dtype=torch.float32)
+    reference = PackedEEGNet.from_braindecode(models).train()
+    packed = PackedEEGNet.from_braindecode(models).train()
+    with torch.autocast("cpu", torch.bfloat16):
+        out = packed(x, moments(packed, x) if precomputed else None)
+    torch.testing.assert_close(out.float(), reference(x), rtol=0.05, atol=0.05)
+    assert packed.bn_temporal.running_var.dtype == torch.float32
+    torch.testing.assert_close(packed.bn_temporal.running_var, reference.bn_temporal.running_var)

@@ -157,9 +157,10 @@ class PackedATCNet(PackedModel):
         with torch.no_grad():
             self.classifier_weight.div_(_max_norm_scale(self.classifier_weight, max_norm_const))
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, moments: tuple[Tensor, Tensor] | None = None) -> Tensor:
+        """x (batch, K, n_chans, n_times) -> (batch, K, n_outputs); ``moments``: see ``input_moments``."""
         B, K, W, F2 = len(x), self.n_models, self.n_windows, self.F2
-        h = self._conv_block(x)  # (batch, K * F2, Tc)
+        h = self._conv_block(x, moments)  # (batch, K * F2, Tc)
         # Window w is h[..., w : w + Tw]; windows become groups, member-major: (batch, K * W, Tw, F2).
         h = h.view(B, K, F2, self.Tc).unfold(-1, self.Tw, 1).permute(0, 1, 3, 4, 2).reshape(B, K * W, self.Tw, F2)
         h = self._attention(h).transpose(2, 3).reshape(B, K * W * F2, self.Tw)
@@ -173,12 +174,15 @@ class PackedATCNet(PackedModel):
         logits = torch.einsum("bkwf,kwof->bkwo", features, weight.view(K, W, self.n_outputs, F2))
         return (logits + self.classifier_bias.view(K, W, self.n_outputs)).mean(2)
 
-    def _conv_block(self, x: Tensor) -> Tensor:
+    def _first_block_conv(self):
+        return self.L1, _same(self.L1)
+
+    def _conv_block(self, x: Tensor, moments: tuple[Tensor, Tensor] | None = None) -> Tensor:
         K, max_norm = self.n_models, self.conv_max_norm_const
         w, s, r = self.temporal_weight, self.spatial_weight, self.refine_weight
         if max_norm is not None:
             w, s, r = w.renorm(2, 0, max_norm), s.renorm(2, 0, max_norm), r.renorm(2, 0, max_norm)
-        h = spatial_first_block(x, w, s.view(K, self.F2, self.n_chans), self.bn_temporal, _same(self.L1))
+        h = spatial_first_block(x, w, s.view(K, self.F2, self.n_chans), self.bn_temporal, _same(self.L1), moments)
         h = self.conv_drop(F.avg_pool1d(F.elu(self.bn_spatial(h)), self.P1))
         h = F.conv1d(F.pad(h, _same(self.L2)), r, groups=K)
         return self.conv_drop(F.avg_pool1d(F.elu(self.bn_refine(h)), self.P2))
