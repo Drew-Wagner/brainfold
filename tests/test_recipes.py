@@ -1,4 +1,5 @@
-"""The recipes' training loop: precomputed input moments change nothing (float64)."""
+"""The recipes' training loop (float64): precomputed input moments change nothing, and with
+schedule-free AdamW a pack trains like its members trained alone."""
 
 import sys
 import warnings
@@ -9,7 +10,7 @@ import torch
 
 pytest.importorskip("moabb")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "recipes" / "moabb"))
-from train import fit  # noqa: E402
+from train import PackOfOne, fit, predict  # noqa: E402
 
 from brainfold import PackedATCNet, PackedEEGNet  # noqa: E402
 
@@ -53,3 +54,38 @@ def test_fit_with_precomputed_moments(cls, kwargs):
     torch.testing.assert_close(losses, reference_losses)
     for key, value in reference.model.state_dict().items():
         torch.testing.assert_close(model.state_dict()[key], value, msg=key)
+
+
+def no_dropout(model):
+    for module in model.modules():
+        if isinstance(module, torch.nn.modules.dropout._DropoutNd):
+            module.p = 0.0
+    return model
+
+
+@pytest.mark.parametrize("cls, kwargs, weight_decay", [
+    (PackedEEGNet, dict(n_times=129, F1=4), None),
+    (PackedATCNet, dict(n_times=257, conv_block_n_filters=4, conv_block_pool_size_1=4, conv_block_pool_size_2=4,
+                        conv_max_norm_const=0.6), dict(conv=0.009, dense=0.5)),
+])
+def test_schedule_free_pack_equals_members(cls, kwargs, weight_decay):
+    """Schedule-free AdamW (warmup, L2, BatchNorm recalibration) on a pack == on each member alone,
+    and evaluating every epoch changes nothing."""
+    g = torch.Generator().manual_seed(0)
+    X = torch.randn(40, 8, kwargs["n_times"], generator=g, dtype=torch.float64) + 0.3
+    y = torch.randint(3, (40,), generator=g)
+    train_idx = torch.stack([torch.arange(0, 24), torch.arange(30, 6, -1), torch.randperm(40, generator=g)[:24]])
+    seeds = [0, 1, 2]
+    model = no_dropout(cls.from_seeds(seeds, n_chans=8, n_outputs=3, **kwargs).double())
+    members = [no_dropout(PackOfOne(m)) for m in model.to_braindecode()]
+    settings = dict(epochs=3, lr=1e-2, batch_size=10, weight_decay=weight_decay, optimizer="schedule-free",
+                    warmup_epochs=1)
+    evaluated = []
+    _, losses = fit(model, X, y, train_idx, seeds, eval_every=1,
+                    on_eval=lambda epoch, m: evaluated.append(predict(m, X, train_idx)), **settings)
+    assert len(evaluated) == 2  # after epochs 1 and 2; not after the last
+    for k, member in enumerate(members):
+        _, member_losses = fit(member, X, y, train_idx[k : k + 1], seeds[k : k + 1], **settings)
+        torch.testing.assert_close(losses[:, k : k + 1], member_losses)
+        for key, value in member.model.state_dict().items():
+            torch.testing.assert_close(model.member_state_dict(k)[key], value, msg=key)

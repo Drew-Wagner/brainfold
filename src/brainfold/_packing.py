@@ -165,8 +165,10 @@ def spatial_first_block(x: Tensor, w: Tensor, s: Tensor, bn: nn.BatchNorm1d, pad
         with torch.no_grad():  # same running-stat update as nn.BatchNorm
             n = B * C * (T + sum(padding) - L + 1)
             bn.num_batches_tracked.add_(1)
-            bn.running_mean.lerp_(mean, bn.momentum)
-            bn.running_var.lerp_(var * n / (n - 1), bn.momentum)
+            # momentum=None: the cumulative average, as nn.BatchNorm
+            momentum = bn.momentum if bn.momentum is not None else 1 / bn.num_batches_tracked.item()
+            bn.running_mean.lerp_(mean, momentum)
+            bn.running_var.lerp_(var * n / (n - 1), momentum)
     else:
         mean, var = bn.running_mean, bn.running_var
     scale = torch.rsqrt(var + bn.eps)

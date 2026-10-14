@@ -39,6 +39,7 @@ import mne
 import moabb
 import moabb.datasets
 import numpy as np
+import schedulefree
 import torch
 import torch.nn.functional as F
 import yaml
@@ -111,8 +112,8 @@ def load_cached(data, cache_dir):
 
 
 def fit(model, X, y, train_idx, seeds, epochs, lr, batch_size, weight_decay=None, class_weight=None,
-        compile=False, autocast_dtype=None):
-    """Train every member with Adam and a cosine learning-rate schedule.
+        compile=False, autocast_dtype=None, optimizer="adam", warmup_epochs=0, eval_every=None, on_eval=None):
+    """Train every member with Adam and a cosine learning-rate schedule, or schedule-free AdamW.
 
     ``model`` maps (batch, K, n_chans, n_times) to (batch, K, n_outputs). Member k
     trains on ``X[train_idx[k]]`` (equal sizes required), shuffled by ``seeds[k]`` alone.
@@ -123,15 +124,36 @@ def fit(model, X, y, train_idx, seeds, epochs, lr, batch_size, weight_decay=None
     ``compile`` trains through ``torch.compile(model)``; ``autocast_dtype`` (e.g.
     torch.bfloat16) runs the model under autocast. ``X`` may be stored in a lower
     precision than the model: batches are converted to the model's dtype.
+
+    ``optimizer="schedule-free"`` is schedule-free AdamW (Defazio et al., 2024) at
+    a constant ``lr``: no schedule, so the model is usable after any epoch. Its
+    weight decay stays the coupled L2 above (added to the gradient, like Adam's),
+    not AdamW's decoupled decay. Its weights are evaluated at the averaged point x
+    while gradients are taken elsewhere, so the BatchNorm statistics are
+    recomputed for x on the training set (see ``recalibrate_batch_norms``).
+    ``warmup_epochs`` warms the learning rate up linearly, per step, for either.
+
+    ``on_eval(epoch, model)`` is called, model ready to evaluate, after every
+    ``eval_every`` epochs but the last; training continues unchanged after it.
     Returns the model and each member's mean training loss per epoch, (epochs, K).
     """
     generators = [torch.Generator(device=train_idx.device).manual_seed(seed) for seed in seeds]
     if weight_decay:
-        params = model.source_optimizer_param_groups(weight_decay["conv"], weight_decay["dense"])
+        groups = model.source_optimizer_param_groups(weight_decay["conv"], weight_decay["dense"])
     else:
-        params = model.parameters()
-    optimizer = torch.optim.Adam(params, lr=lr)
+        groups = [{"params": list(model.parameters())}]
     n_train = train_idx.shape[1]
+    warmup_steps = round(warmup_epochs * math.ceil(n_train / batch_size))
+    decayed = []  # (parameters, L2) that schedule-free decays itself
+    if optimizer == "adam":
+        opt = torch.optim.Adam(groups, lr=lr)
+    elif optimizer == "schedule-free":
+        decayed = [(g["params"], g.pop("weight_decay", 0)) for g in groups]
+        decayed = [(params, l2) for params, l2 in decayed if l2]
+        opt = schedulefree.AdamWScheduleFree(groups, lr=lr, warmup_steps=warmup_steps)
+        opt.train()
+    else:
+        raise ValueError(f"unknown optimizer {optimizer!r}")
     if class_weight == "balanced":
         counts = F.one_hot(y[train_idx]).sum(1).float()  # (K, n_classes)
         weights = n_train / (counts.shape[1] * counts)
@@ -149,33 +171,88 @@ def fit(model, X, y, train_idx, seeds, epochs, lr, batch_size, weight_decay=None
     # Shares model's parameters. Static shapes, one graph per batch size (the last batch is smaller): with
     # dynamic batch sizes, Inductor's backward asserted the full batch's strides on Lee2019_MI (torch 2.14)
     forward = torch.compile(model, dynamic=False) if compile else model
+
+    def logits(rows, forward=forward):
+        """Training-mode logits for the trials train_idx[k, rows[:, k]], (batch, K, n_outputs)."""
+        idx = train_idx.gather(1, rows).T  # (batch, K)
+        with torch.autocast(X.device.type, autocast_dtype, enabled=autocast_dtype is not None):
+            if moments is None:
+                return forward(X[idx].to(dtype)), idx
+            pos = train_pos.gather(1, rows).T
+            return forward(X[idx].to(dtype), tuple(m[pos] for m in moments)), idx
+
+    def recalibrate():
+        positions = torch.arange(n_train, device=train_idx.device).expand(len(seeds), -1)
+        recalibrate_batch_norms(model, lambda: (logits(positions[:, i : i + batch_size], model)
+                                                for i in range(0, n_train, batch_size)))
+
+    def evaluate(epoch):
+        buffers = None
+        if optimizer == "schedule-free":
+            opt.eval()  # the parameters become x
+            buffers = [b.clone() for b in model.buffers()]
+            recalibrate()
+        on_eval(epoch, model)
+        if buffers is not None:
+            for b, saved in zip(model.buffers(), buffers):
+                b.copy_(saved)
+            opt.train()
+
     epoch_losses = torch.zeros(epochs, len(seeds), device=train_idx.device)  # read once at the end: no sync per step
+    step = 0
     for epoch in range(epochs):
-        for group in optimizer.param_groups:
-            group["lr"] = 0.5 * lr * (1 + math.cos(math.pi * epoch / epochs))
         model.train()
         order = torch.stack([torch.randperm(n_train, device=train_idx.device, generator=g) for g in generators])
         for i in range(0, n_train, batch_size):
-            idx = train_idx.gather(1, order[:, i : i + batch_size]).T  # (batch, K)
-            with torch.autocast(X.device.type, autocast_dtype, enabled=autocast_dtype is not None):
-                if moments is None:
-                    logits = forward(X[idx].to(dtype))
-                else:
-                    pos = train_pos.gather(1, order[:, i : i + batch_size]).T
-                    logits = forward(X[idx].to(dtype), tuple(m[pos] for m in moments))
-            losses = F.cross_entropy(logits.float().permute(0, 2, 1), y[idx], reduction="none")
+            if optimizer == "adam":  # cosine over epochs, times the warmup
+                warmup = min(1, (step + 1) / warmup_steps) if warmup_steps else 1
+                for group in opt.param_groups:
+                    group["lr"] = 0.5 * lr * (1 + math.cos(math.pi * epoch / epochs)) * warmup
+            out, idx = logits(order[:, i : i + batch_size])
+            losses = F.cross_entropy(out.float().permute(0, 2, 1), y[idx], reduction="none")
             if class_weight is None:
                 losses = losses.mean(0)
             else:
                 w = weights[members, y[idx]]  # (batch, K)
                 losses = (w * losses).sum(0) / w.sum(0)
-            optimizer.zero_grad(set_to_none=True)
+            opt.zero_grad(set_to_none=True)
             # SUM of the member mean losses: each member gets exactly its own gradient,
             # and one Adam over the packed parameters == K separate Adams.
             losses.sum().backward()
-            optimizer.step()
+            for params, l2 in decayed:  # at the point the gradient was taken, as Adam's weight_decay
+                torch._foreach_add_([p.grad for p in params], params, alpha=l2)
+            opt.step()
+            step += 1
             epoch_losses[epoch] += losses.detach() * idx.shape[0] / n_train
+        if on_eval and eval_every and (epoch + 1) % eval_every == 0 and epoch + 1 < epochs:
+            evaluate(epoch + 1)
+    if optimizer == "schedule-free":
+        opt.eval()
+        recalibrate()
     return model, epoch_losses.cpu()
+
+
+@torch.no_grad()
+def recalibrate_batch_norms(model, batches):
+    """Set every BatchNorm's running statistics to their average over ``batches()``.
+
+    ``batches()`` runs the model in training mode over the training set, as
+    ``torch.optim.swa_utils.update_bn``: the statistics become the averages of
+    the batches' (momentum=None), for the current weights. Dropout masks come
+    from a forked RNG, so training continues as it would have without this.
+    """
+    norms = [m for m in model.modules() if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)]
+    momenta = [bn.momentum for bn in norms]
+    for bn in norms:
+        bn.reset_running_stats()
+        bn.momentum = None
+    device = next(model.parameters()).device
+    with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
+        model.train()
+        for _ in batches():
+            pass
+    for bn, momentum in zip(norms, momenta):
+        bn.momentum = momentum
 
 
 @torch.no_grad()
@@ -277,6 +354,10 @@ def add_common_arguments(parser):
                         help="tf32: TensorFloat-32 matmuls; bf16: also bf16 autocast (BatchNorm statistics stay float32)")
     parser.add_argument("--data-dtype", choices=["float32", "float16"], default="float32",
                         help="dtype of the trials kept on the device; batches are converted to float32")
+    parser.add_argument("--optimizer", choices=["adam", "schedule-free"], default="adam",
+                        help="adam: cosine-annealed (the recipes'); schedule-free: AdamW at a constant lr "
+                             "(Defazio et al., 2024), e.g. with --set train.lr=0.0025")
+    parser.add_argument("--warmup-epochs", type=float, default=0, help="linear learning-rate warmup")
 
 
 def precision_settings(args):
@@ -298,13 +379,26 @@ def warm_up(model, X, y, train_idx, test_idx, seeds, settings):
         predict(warm, X, test_idx, autocast_dtype=settings["autocast_dtype"])
 
 
-def train_and_predict(model, X, y, train_idx, test_idx, seeds, settings):
-    """Test logits (n, K, n_outputs), training losses (epochs, K), training and evaluation seconds."""
+def train_and_predict(model, X, y, train_idx, test_idx, seeds, settings, on_eval=None):
+    """Test logits (n, K, n_outputs), training losses (epochs, K), training and evaluation seconds.
+
+    ``on_eval(epoch, test logits)`` gets the learning curve's points (``fit``'s
+    ``eval_every``); their time is left out of the training seconds.
+    """
+    curve_seconds = 0.0
+
+    def evaluate(epoch, model):
+        nonlocal curve_seconds
+        t = time.perf_counter()
+        on_eval(epoch, predict(model, X, test_idx, autocast_dtype=settings["autocast_dtype"]).cpu())
+        curve_seconds += time.perf_counter() - t
+
     t0 = time.perf_counter()
-    model, losses = fit(model, X, y, train_idx, seeds, **settings)  # returns after a sync (.cpu())
+    model, losses = fit(model, X, y, train_idx, seeds, on_eval=evaluate if on_eval else None,
+                        **settings)  # returns after a sync (.cpu())
     t1 = time.perf_counter()
     logits = predict(model, X, test_idx, autocast_dtype=settings["autocast_dtype"]).cpu()
-    return logits, losses, t1 - t0, time.perf_counter() - t1
+    return logits, losses, t1 - t0 - curve_seconds, time.perf_counter() - t1
 
 
 def peak_memory(device):
@@ -320,11 +414,15 @@ def peak_memory(device):
     return peak
 
 
-def write_results(out, rows, losses, logits):
-    """``out`` (one row per run and method), ``<out>-losses.csv`` and ``<out>-logits.npz``."""
+def write_results(out, rows, losses, logits, curves):
+    """``out`` (one row per run and method), ``<out>-losses.csv``, ``<out>-logits.npz`` and,
+    with --eval-every, ``<out>-curves.csv``."""
     paths = [out, out.with_name(f"{out.stem}-losses.csv"), out.with_name(f"{out.stem}-logits.npz")]
     write_csv(paths[0], rows)
     write_csv(paths[1], losses)
+    if curves:
+        paths.append(out.with_name(f"{out.stem}-curves.csv"))
+        write_csv(paths[3], curves)
     # Every run's test trials, concatenated; run_index says which row of `rows` each belongs to,
     # trial its index in the cached data
     np.savez_compressed(paths[2], logits=np.concatenate([run["logits"] for run in logits]),
@@ -343,6 +441,9 @@ def main():
                         help="also train each run alone as a braindecode model, from the same initial weights")
     parser.add_argument("--out", type=Path, help="write one CSV row per run and method, and the losses and logits")
     parser.add_argument("--prepare-only", action="store_true", help="load and cache the trials, then exit")
+    parser.add_argument("--eval-every", type=int, metavar="EPOCHS",
+                        help="also evaluate the packed models every EPOCHS epochs, for learning curves "
+                             "(<out>-curves.csv); not counted in train_seconds")
     args = parser.parse_args()
     hp = load_hparams(args.hparams, args.set)
     data, train, evaluation = hp["data"], hp["train"], hp["evaluation"]
@@ -365,6 +466,10 @@ def main():
                                                    evaluation.get("n_folds"))]
     env = dict(environment(args.device), data_seconds=data_seconds, data_bytes=data_bytes)
     run = start_run(args.wandb, "recipe", args.hparams, hp, args, env)
+    if run is not None:  # per-epoch charts, one line per pack
+        run.define_metric("epoch")
+        run.define_metric("pack*", step_metric="epoch")
+        run.define_metric("mean/*", step_metric="epoch")
     paths = [write_environment(args.out, env)] if args.out else []
 
     print(f"{architecture} on {data['dataset']} ({evaluation['protocol']}): {len(runs)} runs, "
@@ -372,8 +477,9 @@ def main():
     methods = ["packed", "braindecode"] if args.baseline else ["packed"]
     settings = dict(epochs=train["epochs"], lr=train["lr"], batch_size=train["batch_size"],
                     weight_decay=train.get("weight_decay"), class_weight=train.get("class_weight"),
-                    autocast_dtype=precision_settings(args))
-    rows, losses, logits, seconds = [], [], [], dict.fromkeys(methods, 0.0)
+                    autocast_dtype=precision_settings(args), optimizer=args.optimizer,
+                    warmup_epochs=args.warmup_epochs, eval_every=args.eval_every)
+    rows, losses, logits, curves, seconds = [], [], [], [], dict.fromkeys(methods, 0.0)
     warmed = set()  # (method, members per model, training size, test size) that cudnn.benchmark has seen
     for pack_index, pack in enumerate(packs(runs, train["pack_size"])):
         K, seeds = len(pack), [seed for _, seed, _, _ in pack]
@@ -403,17 +509,29 @@ def main():
             peak_memory(args.device)  # reset the peaks
             # compiling each braindecode model would cost more than it saves
             method_settings = dict(settings, compile=args.compile and method == "packed")
-            outputs = [train_and_predict(m, X, y, train_idx[part], test_idx[part], seeds[part], method_settings)
-                       for m, part in models[method]]
+            curve = {}  # epoch: the members' test scores; learning curves for the packed model only
+            on_eval = (lambda epoch, out: curve.update({epoch: scores(out, labels, metrics)})) \
+                if args.eval_every and method == "packed" else None
+            outputs = [train_and_predict(m, X, y, train_idx[part], test_idx[part], seeds[part], method_settings,
+                                         on_eval) for m, part in models[method]]
             results[method] = dict(
                 logits=torch.cat([o[0] for o in outputs], 1), losses=torch.cat([o[1] for o in outputs], 1),
                 # a packed model's time is shared equally by its members
                 train_seconds=[o[2] / members for o in outputs for _ in range(members)],
                 eval_seconds=[o[3] / members for o in outputs for _ in range(members)],
-                peak=peak_memory(args.device))
+                peak=peak_memory(args.device), curve=curve)
             seconds[method] += sum(o[2] + o[3] for o in outputs)
 
         pack_scores = {m: scores(results[m]["logits"], labels, metrics) for m in methods}
+        packed = results["packed"]
+        if args.eval_every:
+            packed["curve"][train["epochs"]] = pack_scores["packed"]
+        if run is not None:
+            for epoch, loss in enumerate(packed["losses"].mean(1).tolist(), 1):
+                entry = {"epoch": epoch, f"pack{pack_index}/train_loss": loss}
+                for metric in metrics if epoch in packed["curve"] else []:
+                    entry[f"pack{pack_index}/test_{metric}"] = np.mean([s[metric] for s in packed["curve"][epoch]])
+                run.log(entry)
         for k, (name, seed, _, _) in enumerate(pack):
             line = "  ".join(f"{m} " + " ".join(f"{metric} {pack_scores[m][k][metric]:.3f}" for metric in metrics)
                              for m in methods)
@@ -429,9 +547,16 @@ def main():
                               for epoch, loss in enumerate(result["losses"][:, k]))
                 logits.append(dict(logits=result["logits"][:, k].numpy(), labels=labels[:, k].numpy(),
                                    trials=test_idx[k].cpu().numpy()))
+                curves.extend(dict(method=m, seed=seed, fold=name, epoch=epoch, **member_scores[k])
+                              for epoch, member_scores in sorted(result["curve"].items()))
         if args.out:  # after every pack, so a job that runs out of time keeps what it finished
-            result_paths = write_results(args.out, rows, losses, logits)
+            result_paths = write_results(args.out, rows, losses, logits, curves)
 
+    if run is not None and curves:  # the mean learning curve over every run
+        for epoch in sorted({c["epoch"] for c in curves}):
+            points = [c for c in curves if c["epoch"] == epoch]
+            run.log({"epoch": epoch, **{f"mean/test_{metric}": np.mean([c[metric] for c in points])
+                                        for metric in metrics}})
     for m in methods:
         values = {metric: np.array([r[metric] for r in rows if r["method"] == m]) for metric in metrics}
         summary = ", ".join(f"{metric} {v.mean():.3f} ± {v.std():.3f}" for metric, v in values.items())
