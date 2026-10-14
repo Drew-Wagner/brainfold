@@ -26,7 +26,8 @@ import numpy as np
 import torch
 
 from tracking import environment, finish_run, start_run, write_csv, write_environment
-from train import ARCHITECTURES, PackOfOne, add_common_arguments, fit, folds, load_cached, load_hparams
+from train import (ARCHITECTURES, PackOfOne, add_common_arguments, fit, folds, load_cached, load_hparams,
+                   precision_settings)
 
 GRID = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256]
 HEADROOM = 0.9  # fraction of the GPU's memory a pack may fill: fragmentation, workspaces
@@ -65,12 +66,13 @@ def main():
     torch.backends.cudnn.benchmark = True  # as in train.py
 
     X, y, subjects, sessions = load_cached(data, args.cache_dir)
+    X = X.astype(args.data_dtype)
     n_classes = len(np.unique(y))
     _, train_idx, _ = next(folds(evaluation["protocol"], y, subjects, sessions, evaluation.get("n_folds")))
     total = torch.cuda.mem_get_info(device)[1]  # under MIG, the slice's memory
     shape = dict(n_chans=X.shape[1], n_outputs=n_classes, n_times=X.shape[2])
     settings = dict(lr=train["lr"], batch_size=train["batch_size"], weight_decay=train.get("weight_decay"),
-                    class_weight=train.get("class_weight"))
+                    class_weight=train.get("class_weight"), autocast_dtype=precision_settings(args))
     common = dict(config=Path(args.hparams).stem, dataset=data["dataset"], architecture=architecture,
                   n_train=len(train_idx), batch_size=train["batch_size"], data_bytes=X.nbytes, gpu_memory=total,
                   **shape)
@@ -89,14 +91,17 @@ def main():
             model = ARCHITECTURES[architecture].from_seeds(seeds, **shape, **hp["model"]).to(device)
             if method == "braindecode":
                 model = PackOfOne(model.to_braindecode()[0]).to(device)
+            compile = args.compile and method == "packed"
+            if compile:
+                torch._dynamo.reset()  # a new model: drop the last one's graphs (dynamo limits recompiles)
             idx = torch.from_numpy(train_idx).to(device).expand(K, -1)
             # Warm-up: cudnn.benchmark tries algorithms with large workspaces, so peak memory is measured after
-            fit(model, X, y, idx, seeds, epochs=1, **settings)
+            fit(model, X, y, idx, seeds, epochs=1, compile=compile, **settings)  # and compiles
             torch.cuda.synchronize(device)
             torch.cuda.reset_peak_memory_stats(device)
             epochs, t0 = 0, time.perf_counter()
             while epochs < args.epochs or time.perf_counter() - t0 < args.min_seconds:
-                fit(model, X, y, idx, seeds, epochs=1, **settings)  # returns after a sync (.cpu())
+                fit(model, X, y, idx, seeds, epochs=1, compile=compile, **settings)  # returns after a sync
                 epochs += 1
             seconds = (time.perf_counter() - t0) / epochs
             row.update(oom=False, epochs=epochs, seconds_per_epoch=seconds, seconds_per_model_epoch=seconds / K,

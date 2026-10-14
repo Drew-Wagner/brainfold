@@ -110,7 +110,8 @@ def load_cached(data, cache_dir):
         return tuple(f[f"arr_{i}"] for i in range(4))
 
 
-def fit(model, X, y, train_idx, seeds, epochs, lr, batch_size, weight_decay=None, class_weight=None):
+def fit(model, X, y, train_idx, seeds, epochs, lr, batch_size, weight_decay=None, class_weight=None,
+        compile=False, autocast_dtype=None):
     """Train every member with Adam and a cosine learning-rate schedule.
 
     ``model`` maps (batch, K, n_chans, n_times) to (batch, K, n_outputs). Member k
@@ -119,6 +120,9 @@ def fit(model, X, y, train_idx, seeds, epochs, lr, batch_size, weight_decay=None
     ATCNet code's L2 weight decay, through ``source_optimizer_param_groups``.
     ``class_weight="balanced"`` weights each member's loss by the inverse class
     frequencies of its own training set, as ``F.cross_entropy(weight=...)`` does.
+    ``compile`` trains through ``torch.compile(model)``; ``autocast_dtype`` (e.g.
+    torch.bfloat16) runs the model under autocast. ``X`` may be stored in a lower
+    precision than the model: batches are converted to the model's dtype.
     Returns the model and each member's mean training loss per epoch, (epochs, K).
     """
     generators = [torch.Generator(device=train_idx.device).manual_seed(seed) for seed in seeds]
@@ -136,10 +140,13 @@ def fit(model, X, y, train_idx, seeds, epochs, lr, batch_size, weight_decay=None
     members = torch.arange(len(seeds), device=train_idx.device)
     # The first BatchNorm's input moments, once per training trial instead of every step;
     # train_pos[k, i] is train_idx[k, i]'s row in them
+    dtype = next(model.parameters()).dtype
     moments = None
     if hasattr(model, "input_moments"):
         trials, train_pos = train_idx.unique(return_inverse=True)
-        moments = model.input_moments(X[trials])
+        chunks = [model.input_moments(X[trials[i : i + 1024]].to(dtype)) for i in range(0, len(trials), 1024)]
+        moments = tuple(torch.cat(parts) for parts in zip(*chunks))
+    forward = torch.compile(model) if compile else model  # shares model's parameters
     epoch_losses = torch.zeros(epochs, len(seeds), device=train_idx.device)  # read once at the end: no sync per step
     for epoch in range(epochs):
         for group in optimizer.param_groups:
@@ -148,12 +155,13 @@ def fit(model, X, y, train_idx, seeds, epochs, lr, batch_size, weight_decay=None
         order = torch.stack([torch.randperm(n_train, device=train_idx.device, generator=g) for g in generators])
         for i in range(0, n_train, batch_size):
             idx = train_idx.gather(1, order[:, i : i + batch_size]).T  # (batch, K)
-            if moments is None:
-                logits = model(X[idx])
-            else:
-                pos = train_pos.gather(1, order[:, i : i + batch_size]).T
-                logits = model(X[idx], tuple(m[pos] for m in moments))
-            losses = F.cross_entropy(logits.permute(0, 2, 1), y[idx], reduction="none")
+            with torch.autocast(X.device.type, autocast_dtype, enabled=autocast_dtype is not None):
+                if moments is None:
+                    logits = forward(X[idx].to(dtype))
+                else:
+                    pos = train_pos.gather(1, order[:, i : i + batch_size]).T
+                    logits = forward(X[idx].to(dtype), tuple(m[pos] for m in moments))
+            losses = F.cross_entropy(logits.float().permute(0, 2, 1), y[idx], reduction="none")
             if class_weight is None:
                 losses = losses.mean(0)
             else:
@@ -169,10 +177,13 @@ def fit(model, X, y, train_idx, seeds, epochs, lr, batch_size, weight_decay=None
 
 
 @torch.no_grad()
-def predict(model, X, idx, batch_size=64):
+def predict(model, X, idx, batch_size=64, autocast_dtype=None):
     """(n, K, n_outputs) logits; column k is member k's output for ``X[idx[k]]``."""
     model.eval()
-    return torch.cat([model(X[idx[:, i : i + batch_size].T]) for i in range(0, idx.shape[1], batch_size)])
+    dtype = next(model.parameters()).dtype
+    with torch.autocast(X.device.type, autocast_dtype, enabled=autocast_dtype is not None):
+        return torch.cat([model(X[idx[:, i : i + batch_size].T].to(dtype)).float()
+                          for i in range(0, idx.shape[1], batch_size)])
 
 
 class PackOfOne(torch.nn.Module):
@@ -259,6 +270,17 @@ def add_common_arguments(parser):
                         default=str(Path.home() / ".cache" / "brainfold"),
                         help="where preprocessed trials are cached; 'none' to disable")
     parser.add_argument("--wandb", metavar="PROJECT", help="log to this W&B project (set WANDB_MODE=offline on clusters)")
+    parser.add_argument("--compile", action="store_true", help="train packed models through torch.compile")
+    parser.add_argument("--precision", choices=["float32", "tf32", "bf16"], default="float32",
+                        help="tf32: TensorFloat-32 matmuls; bf16: also bf16 autocast (BatchNorm statistics stay float32)")
+    parser.add_argument("--data-dtype", choices=["float32", "float16"], default="float32",
+                        help="dtype of the trials kept on the device; batches are converted to float32")
+
+
+def precision_settings(args):
+    """Apply ``--precision`` globally; returns the autocast dtype for ``fit`` and ``predict``."""
+    torch.backends.cuda.matmul.allow_tf32 = args.precision in ("tf32", "bf16")
+    return torch.bfloat16 if args.precision == "bf16" else None
 
 
 def warm_up(model, X, y, train_idx, test_idx, seeds, settings):
@@ -271,7 +293,7 @@ def warm_up(model, X, y, train_idx, test_idx, seeds, settings):
     """
     with torch.random.fork_rng(devices=[X.device]):
         warm = fit(copy.deepcopy(model), X, y, train_idx, seeds, **{**settings, "epochs": 1})[0]
-        predict(warm, X, test_idx)
+        predict(warm, X, test_idx, autocast_dtype=settings["autocast_dtype"])
 
 
 def train_and_predict(model, X, y, train_idx, test_idx, seeds, settings):
@@ -279,7 +301,7 @@ def train_and_predict(model, X, y, train_idx, test_idx, seeds, settings):
     t0 = time.perf_counter()
     model, losses = fit(model, X, y, train_idx, seeds, **settings)  # returns after a sync (.cpu())
     t1 = time.perf_counter()
-    logits = predict(model, X, test_idx).cpu()
+    logits = predict(model, X, test_idx, autocast_dtype=settings["autocast_dtype"]).cpu()
     return logits, losses, t1 - t0, time.perf_counter() - t1
 
 
@@ -332,7 +354,8 @@ def main():
         print(f"{data['dataset']}: {len(X)} trials of {X.shape[1]} channels x {X.shape[2]} samples")
         return
     n_classes, data_bytes = len(np.unique(y)), X.nbytes
-    X, y = torch.from_numpy(X).to(args.device), torch.from_numpy(y).to(args.device)
+    X = torch.from_numpy(X).to(args.device, getattr(torch, args.data_dtype))
+    y = torch.from_numpy(y).to(args.device)
     data_seconds = time.perf_counter() - t0  # loading (or preprocessing) and copying to the device
     runs = [(name, seed, torch.from_numpy(train_idx), torch.from_numpy(test_idx))
             for seed in train["seeds"]
@@ -346,7 +369,8 @@ def main():
           f"{len(X)} trials of {X.shape[1]} channels x {X.shape[2]} samples, {n_classes} classes", flush=True)
     methods = ["packed", "braindecode"] if args.baseline else ["packed"]
     settings = dict(epochs=train["epochs"], lr=train["lr"], batch_size=train["batch_size"],
-                    weight_decay=train.get("weight_decay"), class_weight=train.get("class_weight"))
+                    weight_decay=train.get("weight_decay"), class_weight=train.get("class_weight"),
+                    autocast_dtype=precision_settings(args))
     rows, losses, logits, seconds = [], [], [], dict.fromkeys(methods, 0.0)
     warmed = set()  # (method, members per model, training size, test size) that cudnn.benchmark has seen
     for pack_index, pack in enumerate(packs(runs, train["pack_size"])):
@@ -363,16 +387,21 @@ def main():
             models["braindecode"] = [(PackOfOne(single), slice(k, k + 1))
                                      for k, single in enumerate(model.to_braindecode())]
 
+        if args.compile:
+            torch._dynamo.reset()  # a new model: drop the last pack's graphs (dynamo limits recompiles)
         results = {}
         for method in methods:
             members = K if method == "packed" else 1  # per model
             shape = (method, members, train_idx.shape[1], test_idx.shape[1])
             if args.device.type == "cuda" and shape not in warmed:
                 first, part = models[method][0]
-                warm_up(first, X, y, train_idx[part], test_idx[part], seeds[part], settings)
+                warm_up(first, X, y, train_idx[part], test_idx[part], seeds[part],
+                        dict(settings, compile=args.compile and method == "packed"))
                 warmed.add(shape)
             peak_memory(args.device)  # reset the peaks
-            outputs = [train_and_predict(m, X, y, train_idx[part], test_idx[part], seeds[part], settings)
+            # compiling each braindecode model would cost more than it saves
+            method_settings = dict(settings, compile=args.compile and method == "packed")
+            outputs = [train_and_predict(m, X, y, train_idx[part], test_idx[part], seeds[part], method_settings)
                        for m, part in models[method]]
             results[method] = dict(
                 logits=torch.cat([o[0] for o in outputs], 1), losses=torch.cat([o[1] for o in outputs], 1),
