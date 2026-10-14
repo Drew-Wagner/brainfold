@@ -278,6 +278,55 @@ distribution of results. Use them for sweeps and exploration. For
 comparisons that need matching runs, use float32, which is also what the
 `--baseline` braindecode models are compared against.
 
+### Convergence options
+
+The recipes train with Adam at lr 0.001, cosine-annealed over the papers' 300
+(EEGNet) or 500 (ATCNet) epochs. These options train in fewer epochs. They are
+off by default, so the recipes' results stay as they are:
+
+- `--optimizer schedule-free` uses schedule-free AdamW (Defazio et al., 2024;
+  the `schedulefree` package) at a constant learning rate, set with
+  `--set train.lr=...`. It needs no schedule, so the model after any epoch is
+  usable, and one run gives every shorter budget. Its BatchNorm statistics are
+  recomputed on the training set for the weights it evaluates. ATCNet's official
+  L2 stays coupled, as with Adam.
+- `--recalibrate-bn` recomputes the BatchNorm statistics with Adam too. EEGNet's
+  BatchNorm momentum is 0.01, so its running statistics trail the weights by
+  about 100 steps, about 20 epochs on BNCI2014001. That only matters for short
+  budgets.
+- `--warmup-epochs` adds a linear warmup. It didn't help here.
+- `--eval-every N` evaluates every N epochs and writes the learning curves to
+  `<out>-curves.csv` and to W&B. The time it takes is left out of
+  `train_seconds`.
+
+Both are exact: a pack trains like its members trained alone (float64 test).
+
+On the RTX 4080 SUPER, with `--compile`. The difference is per run, against
+the recipe, with its standard error:
+
+| recipe | runs | training | accuracy | difference per run | reaches the recipe's accuracy at |
+|---|---|---|---|---|---|
+| BNCI2014001 EEGNet | 54 | Adam, lr 0.001, 300 epochs (the recipe) | 0.669 | | 300 epochs |
+| | | Adam, lr 0.005, 150 epochs, `--recalibrate-bn` | 0.670 | +0.001 ± 0.005 | 150 epochs |
+| | | schedule-free, lr 0.005, 300 epochs | 0.677 | +0.008 ± 0.005 | about 150 epochs |
+| BNCI2014001 ATCNet | 54 | Adam, lr 0.001, 500 epochs (the recipe) | 0.692 | | 500 epochs |
+| | | Adam, lr 0.0025, 250 epochs, `--recalibrate-bn` | 0.691 | -0.001 ± 0.005 | 250 epochs |
+| | | schedule-free, lr 0.005, 500 epochs | 0.722 | +0.030 ± 0.005 | about 150-200 epochs |
+| Lee2019_MI EEGNet | 108 | Adam, lr 0.001, 300 epochs (the recipe) | 0.694 | | 300 epochs |
+| | | schedule-free, lr 0.005, 300 epochs | 0.709 | +0.015 ± 0.004 | about 100 epochs |
+| Lee2019_MI ATCNet | 108 | Adam, lr 0.001, 500 epochs (the recipe) | 0.675 | | 500 epochs |
+| | | schedule-free, lr 0.005, 500 epochs | 0.693 | +0.018 ± 0.006 | about 150 epochs |
+
+Schedule-free reaches the recipe's accuracy in about a third of the epochs, and
+ends higher when given the full budget. Its learning rate was chosen on
+BNCI2014001's test sessions, among 0.001, 0.0025, 0.005 and 0.01. It was then
+fixed in advance for Lee2019_MI, where it was not tuned. With Adam, lr 0.001
+was simply too low: at the recipe's learning rate, halving the epochs costs
+0.045 (EEGNet) and 0.030 (ATCNet). Each schedule-free epoch takes about as long
+as an Adam one.
+
+    python train.py hparams/bnci2014001_atcnet.yaml --optimizer schedule-free --set train.lr=0.005 train.epochs=200
+
 ### Results
 
 On an RTX 4080 SUPER, packed and with `--baseline`, seeds 0, 1 and 2 (seed 0
