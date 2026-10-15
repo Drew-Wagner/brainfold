@@ -327,6 +327,34 @@ as an Adam one.
 
     python train.py hparams/bnci2014001_atcnet.yaml --optimizer schedule-free --set train.lr=0.005 train.epochs=200
 
+### SpeechBrain-MOABB's protocol
+
+`sb_search.py` runs the decoding protocol of SpeechBrain-MOABB (Borra,
+Magosso and Ravanelli, 2024) with packed training. It reproduces their
+preprocessing, their leave-one-session-out splits with class-balanced
+validation sets, their training (Xavier init, Adam with a triangular cyclic
+learning rate, class-weighted loss, four augmentations, averaging of the last
+epochs' weights), and their two-step search: 50 TPE trials on the
+preprocessing, architecture and training, then 50 on the augmentation, then
+10 seeds over every fold. A trial trains all its folds as one pack.
+`tests/test_sb_protocol.py` checks each piece against their code. Changes:
+
+- Optuna's TPE replaces Orion's, with the same startup and candidate counts.
+- BatchNorm momentum joins step 1's search (their EEGNet fixes it at 0.01).
+- The model is braindecode's EEGNet with their hyperparameters.
+- `--optimizer schedule-free` swaps in schedule-free AdamW. The number of
+  epochs is then chosen on the validation sets (every 25 epochs from 250 to
+  1000) instead of searched, with no checkpoint averaging. BatchNorm statistics
+  are recomputed, so the momentum drops out.
+
+Their tuned BNCI2014001 configuration, with one seed, scores 0.723 balanced
+accuracy, against their 0.732 ± 0.004 over 10 seeds (one seed varies by
+0.013). Its 18 folds trained in 616 s on the RTX 4080 SUPER. Random step-1
+trials took 11-98 s, plus 12 s to preprocess.
+
+    python sb_search.py hparams/sb_moabb/bnci2014001_eegnet.yaml --out results/sb/adam
+    python sb_search.py hparams/sb_moabb/bnci2014001_eegnet.yaml --optimizer schedule-free --out results/sb/sf
+
 ### Results
 
 On an RTX 4080 SUPER, packed and with `--baseline`, seeds 0, 1 and 2 (seed 0
