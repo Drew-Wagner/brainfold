@@ -355,6 +355,87 @@ trials took 11-98 s, plus 12 s to preprocess.
     python sb_search.py hparams/sb_moabb/bnci2014001_eegnet.yaml --out results/sb/adam
     python sb_search.py hparams/sb_moabb/bnci2014001_eegnet.yaml --optimizer schedule-free --out results/sb/sf
 
+### The improved protocol
+
+[`recipes/moabb/PROTOCOL_IDEAS.md`](recipes/moabb/PROTOCOL_IDEAS.md) lists
+what we'd change in their protocol, and why. `sb_search.py` implements most of
+it behind options that are all off by default, so the commands above still
+run SpeechBrain-MOABB's protocol. `hparams/sb_moabb/improved/bnci2014001_eegnet.yaml`
+turns them on, with the reason for every choice next to it:
+
+- **Steps from the yaml** (`steps`): step 0 searches only the preprocessing
+  (band, window start and length, channels) on a fixed reference model,
+  Lawhern et al.'s EEGNet-8,2; step 1 the architecture and training; step 2
+  the augmentation. Temporal kernel and pool sizes can be in seconds.
+- **EEG augmentation** (`augment: eeg`): braindecode's TimeReverse, SignFlip,
+  FTSurrogate, FrequencyShift, BandstopFilter, SmoothTimeMask and
+  ChannelsDropout (and Mixup), with the transforms and ranges of Rommel et
+  al. (2022). Every random draw is the member's own (a hash of its seed, the
+  step and the position in the batch), so a packed member is augmented exactly
+  as it would be alone; the tests check that packed training equals training
+  each member alone, and each transform equals braindecode's.
+- **Cross-validation within the training session** (`protocol.inner_folds`):
+  one validation fold per run (`runs`), or k folds; each (subject, test
+  session, inner fold, seed) is a cell, a member of a pack.
+- **Seeds per trial** (`seeds_per_trial`, `trial_seeds: per_trial`,
+  `seed_per_inner_fold`), different in every trial; per-seed and per-fold
+  scores and the objective's standard error are recorded.
+- **Size**: every trial records one member's parameters and FLOPs;
+  `selection: one_se` passes on the smallest configuration within one
+  standard error of the best; `multi_objective: true` runs TPE on (validation,
+  size).
+- **Selection nested by test session** (`nested_by_test_session`): one
+  search per test session, on the folds that test on it, so no session helps
+  choose the configuration it's tested with (averaging validation over every
+  fold, as their protocol does, lets it).
+- **The search's own variance**: `--tpe-seed` and `--trial-seed` for
+  replicate searches, `--rerun STEP` to retrain a study's best trials with new
+  seeds, and `sb_analyze.py` for validation against size with Pareto fronts,
+  fANOVA importances, and the spread of replicate searches.
+
+BNCI2014001 is the development dataset: no default above was chosen from
+accuracy on it, and results on it are exploratory until the protocol is
+frozen and run on held-out datasets (PROTOCOL_IDEAS.md, "Development vs
+held-out datasets").
+
+    python sb_search.py hparams/sb_moabb/improved/bnci2014001_eegnet.yaml --optimizer schedule-free --out results/sb/imp
+    python sb_search.py hparams/sb_moabb/improved/bnci2014001_eegnet.yaml --optimizer schedule-free --out results/sb/imp-r1 \
+        --tpe-seed 1 --trial-seed 1   # a replicate search
+    python sb_search.py hparams/sb_moabb/bnci2014001_eegnet.yaml --out results/sb/adam --rerun step1 \
+        --rerun-top 10 --rerun-seeds 5   # their protocol's 10 best step-1 trials, 5 new seeds each
+    uv run --with matplotlib python sb_analyze.py results/sb/imp results/sb/imp-r1 --out results/sb/analysis
+
+A nested search's directory has one subdirectory per test session
+(`test-0train/`, `test-1test/`); pass those to `sb_analyze.py`.
+`cluster/drac/sb_improved.sbatch` runs each test session's search as its own
+array task.
+
+**Cost.** One trial on the RTX 4080 SUPER, all 9 subjects, schedule-free for
+1000 epochs with an evaluation every 25 (another process shared the GPU, so
+these are rough):
+
+| model | protocol | cells | packs | training | peak memory |
+|---|---|---|---|---|---|
+| EEGNet-8,2 (2.4k parameters) | theirs | 18 | 1 | 29 s | 5.1 GiB |
+| EEGNet-8,2 | improved, no nesting | 108 | 3 | 139 s | 5.6 GiB |
+| EEGNet-8,2, EEG augmentation | theirs | 18 | 1 | 86 s | 1.7 GiB |
+| EEGNet-8,2, EEG augmentation | improved, no nesting | 108 | 3 | 388 s | 2.7 GiB |
+| their tuned EEGNet (146k) | theirs | 18 | 1 | 312 s | 10.3 GiB |
+| their tuned EEGNet | improved, no nesting | 108 | 6 | 1911 s | 10.6 GiB |
+
+The improved protocol's 108 cells are 6 validation folds (one per run) of the
+18 subject-sessions; nested by test session, each of the two searches has 54.
+Past about 18 cells a pack is compute-bound: 2.6-2.8 ms per cell and epoch for
+EEGNet-8,2 from 18 to 108 cells, so cost grows about linearly with cells. Their
+tuned model's packs of 36 ran out of memory and were split to 18 (153 s
+lost); packs of 9, from splitting larger packs further, took 73 ms per cell and
+epoch against 24 ms in packs of 18, which is why the improved yaml packs 36
+cells rather than more. EEG augmentation makes small models' training about
+2.8x slower (10 ms per batch of 32 x 36 members, mostly the FFTs and many small
+kernels). Preprocessing a new band and window takes 13 s. Estimated per test
+session's search on an H100 2g.20gb slice: about 9-10 h (step 0 1.2 h, step 1
+about 5.5 h, step 2 2-3 h, final 0.3 h; the sbatch file has the reasoning).
+
 ### Results
 
 On an RTX 4080 SUPER, packed and with `--baseline`, seeds 0, 1 and 2 (seed 0

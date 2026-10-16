@@ -1,0 +1,152 @@
+# The improved search protocol (recipes/moabb/PROTOCOL_IDEAS.md) for EEGNet on
+# BNCI2014001, with sb_search.py --optimizer schedule-free. BNCI2014001 is the
+# development dataset: its results are exploratory. Every choice below is taken from
+# the literature, from SpeechBrain-MOABB's priors, or from cost, never from accuracy
+# on BNCI2014001; the reason is next to each. For a held-out dataset, copy this file
+# and change only the dataset block and what the comments mark as per dataset.
+
+# ---- the dataset (per dataset) ----
+dataset: BNCI2014_001
+n_classes: 4
+sample_rate: 125  # Hz, MOABB's resampling; SpeechBrain-MOABB's for this dataset
+valid_ratio: 0.2  # unused with inner_folds (SpeechBrain-MOABB's split, with protocol.inner_folds=0)
+
+# ---- the search, as SpeechBrain-MOABB's ----
+metric: acc  # balanced accuracy
+seed: 1986  # TPE's and the base of the trials' seeds; --tpe-seed and --trial-seed for replicate searches
+final_seeds: 10
+trials: 50  # per step (theirs)
+startup_trials: 20  # theirs
+ei_candidates: 24  # theirs
+pack_size: 36  # cells per pack; their tuned EEGNet (146k parameters) runs out of 16 GB at 27, which then
+               # splits; past 18 cells, larger packs gave no speedup on the RTX 4080 SUPER (measured)
+
+protocol:
+  # Validation: one fold per run of the training session (6 on BNCI2014001). Whole runs
+  # keep validation temporally separate from training, as the test session is; one run
+  # out keeps 5/6 of the training data, close to the final training on all of it; every
+  # training trial is validated once. Per dataset: needs at least 2 runs per training
+  # session(s); with a single run, use inner_folds: 5 and group_by_run: false (every
+  # 5th trial of each class; 5 as the usual k, Hastie et al., 2009, 7.10).
+  inner_folds: runs
+  group_by_run: true
+  # Seeds: every inner fold trains from its own seed, and the seeds differ in every
+  # trial (so TPE can't fit one seed's draw): 6 seeds per trial at the cost of one,
+  # and 6 replicates for the standard error. Not more seeds crossed with the folds,
+  # for cost: on the RTX 4080 SUPER a trial's time grows about linearly with its cells
+  # past 18 (README, "The improved protocol"), and 6 folds already make 108 cells.
+  seeds_per_trial: 1
+  seed_per_inner_fold: true
+  trial_seeds: per_trial
+  # What a step passes on: the smallest model within one standard error of the best
+  # (Breiman et al., 1984; Hastie et al., 2009, 7.10), by parameter count.
+  selection: one_se
+  size: params
+  multi_objective: false  # true: TPE on (validation, parameters), the Pareto front in sb_analyze.py
+  # Selection nested by test session: one search per test session, on the folds that test
+  # on it, so no session helps choose the configuration it's tested with. Averaging over
+  # every fold, as their protocol does, validates on session A for the fold that tests on
+  # B and so lets A choose the configuration for the fold that tests on A. With 2
+  # sessions: 2 searches of 9 folds, the same number of models as one of 18. Each
+  # search goes to <out>/test-<session>/; --test-session runs one of them alone.
+  nested_by_test_session: true
+  # The final evaluation trains on every training trial (no validation needed: the
+  # epochs are chosen in the search) with the augmentation chosen in step 2.
+  final_train: all
+  final_augment: eeg
+
+# Values a step doesn't search; the model and training here are step 0's reference.
+fixed:
+  # preprocessing: MOABB MotorImagery's defaults (8-32 Hz), the whole trial, 2 steps from Cz
+  fmin: 8.0
+  fmax: 32.0
+  tmin: 0.0
+  twindow: 4.0  # the window's length from tmin, cut at the trial's end (4 s here)
+  n_steps_channel_selection: 2
+  # training (Adam only: with schedule-free these aren't used): the middle of their priors
+  number_of_epochs: 625
+  avg_models: 8
+  bn_momentum: 0.1  # PyTorch's default
+  lr: 0.001  # Adam's default (Kingma and Ba, 2015)
+  batch_size_exponent: 5  # 32, the middle of their prior (16-64)
+  # EEGNet: Lawhern et al. (2018)'s EEGNet-8,2, temporal sizes in seconds (0.5 s kernels:
+  # 64 samples at their 128 Hz; second pooling 8 samples at 32 Hz), so a searched
+  # sample rate keeps their meaning
+  cnn_temporal_kernels: 8
+  cnn_spatial_depth_multiplier: 2
+  cnn_septemporal_point_kernels_ratio_: 4  # F2 = ceil(4/4 * 8 * 2 + 1) = 17, their parametrization's nearest to 16
+  cnn_temporal_kernel_s: 0.5
+  cnn_septemporal_kernel_s: 0.5
+  cnn_septemporal_pool_s: 0.25
+  cnn_spatial_pool: 4
+  max_cnn_spatial_pool: 4
+  cnn_spatial_max_norm: 1.0  # EEGNet's
+  dense_max_norm: 0.25  # EEGNet's
+  dropout: 0.5  # Lawhern et al.'s for within-subject decoding
+
+steps:
+  # Step 0: preprocessing alone, on the reference model above (Lawhern et al.'s EEGNet-8,2
+  # with their within-subject dropout, Adam's default lr), so it doesn't depend on an
+  # architecture searched on top of it.
+  step0:
+    augment: none
+    epochs: grid
+    search:
+      fmin: uniform(0.1, 5, precision=2)  # their prior
+      fmax: uniform(20.0, 50.0, precision=3)  # their prior
+      tmin: uniform(0.0, 1.0, precision=2)  # from the cue to 1 s after: motor imagery's ERD starts within it
+      twindow: uniform(1.0, 4.0, precision=2)  # their tmax prior as a length (cut at the trial's end)
+      n_steps_channel_selection: uniform(1, 3, discrete=True)  # their prior
+      # sample_rate: choices([100, 125, 250])  # per dataset (at most the recording's rate); not searched by default
+  # Step 1: the architecture and training, their step-1 priors (temporal sizes converted
+  # to seconds at their 125 Hz: 24-62 samples, 3-24 and 1-8 samples after pooling by 4).
+  step1:
+    augment: none
+    epochs: grid  # a new model: choose its epoch again
+    search:
+      lr: choices([0.01, 0.005, 0.001, 0.0005, 0.0001])
+      batch_size_exponent: uniform(4, 6, discrete=True)
+      number_of_epochs: uniform(250, 1000, discrete=True)  # Adam only
+      avg_models: uniform(1, 15, discrete=True)  # Adam only
+      bn_momentum: loguniform(0.001, 1.0)  # Adam only
+      cnn_temporal_kernels: uniform(4, 64, discrete=True)
+      cnn_temporal_kernel_s: uniform(0.19, 0.5, precision=2)
+      cnn_spatial_depth_multiplier: uniform(1, 4, discrete=True)
+      cnn_septemporal_point_kernels_ratio_: uniform(0, 8, discrete=True)
+      cnn_septemporal_kernel_s: uniform(0.096, 0.77, precision=2)
+      cnn_septemporal_pool_s: uniform(0.032, 0.256, precision=2)
+      dropout: uniform(0.0, 0.5)
+  # Step 2: EEG augmentation instead of SpeechBrain's speech augmentations. The transforms
+  # and magnitude ranges are Rommel et al. (2022, J. Neural Eng., "Data augmentation for
+  # learning predictive models on EEG: a systematic comparison", Tables 2-4), each applied
+  # with probability 0.5 as there, or off. Kept: those that helped motor imagery there
+  # (TimeReverse, SmoothTimeMask, FTSurrogate, FrequencyShift, BandstopFilter,
+  # ChannelsDropout) and SignFlip (no effect there, explained by their model squaring its
+  # activations, which EEGNet doesn't). Left out: ChannelsShuffle and ChannelsSymmetry
+  # (harmful for motor imagery there), GaussianNoise (no robust gain there),
+  # SensorsRotation (not significant there; not implemented), Mixup (not in their
+  # comparison; available as aug_mixup_p and aug_mixup_alpha). Their motor-imagery
+  # dataset was BCI IV 2a, i.e. this one, so on BNCI2014001 this choice isn't independent
+  # of the data; on held-out datasets it is.
+  step2:
+    augment: eeg  # trains to step 1's chosen epoch, as SpeechBrain-MOABB's step 2
+    search:
+      aug_time_reverse_p: choices([0.0, 0.5])
+      aug_sign_flip_p: choices([0.0, 0.5])
+      aug_ft_surrogate_p: choices([0.0, 0.5])
+      aug_ft_surrogate_phase: uniform(0.0, 1.0)  # phase noise up to this x 2 pi
+      aug_frequency_shift_p: choices([0.0, 0.5])
+      aug_frequency_shift_hz: uniform(0.0, 3.0)
+      aug_bandstop_p: choices([0.0, 0.5])
+      aug_bandstop_hz: uniform(0.0, 2.0)
+      aug_time_mask_p: choices([0.0, 0.5])
+      aug_time_mask_s: uniform(0.0, 2.0)
+      aug_channels_dropout_p: choices([0.0, 0.5])
+      aug_channels_dropout_drop: uniform(0.0, 1.0)
+
+# Schedule-free: the epoch is chosen on validation, every 25 epochs from 250 to 1000
+# (their number_of_epochs prior), with BatchNorm statistics recomputed before each
+# evaluation; every cell's scores at every one of these epochs go to trials/*.cells.npz.
+schedule_free:
+  not_searched: [number_of_epochs, avg_models, bn_momentum]
+  epochs: {first: 250, last: 1000, every: 25}
