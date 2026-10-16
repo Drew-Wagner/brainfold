@@ -6,6 +6,10 @@ makes affordable now. The longer research plan for adaptive allocation is the
 doc "Adaptive Subject and Seed Allocation for EEG Hyperparameter Search"
 (https://claude.ai/artifact/GQvWNHe2SqdaProVMcPzMR).
 
+The protocol itself, the rules for changing it and the log of variants run are
+in `PROTOCOL.md` (version 2, draft). This file keeps the ideas and their
+implementation notes.
+
 Ideas 1-4, 6, 7 and 11 are implemented behind options that are off by default, so
 `hparams/sb_moabb/bnci2014001_eegnet.yaml` still runs SpeechBrain-MOABB's
 protocol; `hparams/sb_moabb/improved/bnci2014001_eegnet.yaml` turns them on.
@@ -95,7 +99,7 @@ they generate hypotheses and catch bugs, but they don't test the protocol.
 
 | # | Idea | Status |
 |---|---|---|
-| 1 | Search preprocessing in its own step | implemented (`steps`, step 0) |
+| 1 | Search preprocessing in its own step | implemented (`steps`, step 0); dropped in version 2, which fixes preprocessing (`PROTOCOL.md`) |
 | 2 | EEG-specific augmentation | implemented (`augment: eeg`) |
 | 3 | Validation by cross-validation within the training data | implemented (`protocol.inner_folds`) |
 | 4 | Several seeds per trial, different between trials | implemented (`protocol.seeds_per_trial`, `trial_seeds`) |
