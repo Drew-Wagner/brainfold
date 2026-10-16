@@ -68,6 +68,17 @@ def test_cells_with_inner_folds():
     assert len(final[0]["train"]) == len(np.union1d(data["folds"][0][1], data["folds"][0][2]))
 
 
+def test_nested_by_test_session():
+    """A nested search's folds test on its session, and none of them trains or validates on it."""
+    data = fake_data(sessions=("0train", "1test", "2extra"))
+    for session in ("0train", "1test", "2extra"):
+        folds = sb_search.testing_on(data["folds"], session)
+        assert len(folds) == 3  # one per subject
+        for name, train, valid, test in folds:
+            assert set(data["sessions"][test]) == {session}
+            assert session not in set(data["sessions"][np.concatenate([train, valid])])
+
+
 def test_trial_seeds():
     assert sb_search.trial_seeds(1986, 1, 7, False) == [1986]
     assert sb_search.trial_seeds(1986, 3, 7, False) == [1986, 1987, 1988]

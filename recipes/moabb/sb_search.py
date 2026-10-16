@@ -36,8 +36,10 @@ as before; the hparams files under hparams/sb_moabb/improved/ turn them on):
   (`group_by_run`: of whole runs), `seeds_per_trial` seeds (`trial_seeds:
   per_trial` for seeds that differ between trials), `selection: one_se` (the
   smallest model within one standard error of the best), `multi_objective`
-  (TPE on validation and parameter count), `final_train: all` and
-  `final_augment`.
+  (TPE on validation and parameter count), `nested_by_test_session` (one
+  search per test session, on the folds that test on it, so no session helps
+  choose the configuration it's tested with; --test-session runs one of them),
+  `final_train: all` and `final_augment`.
 - Kernel and pool sizes in seconds (`cnn_temporal_kernel_s`, ...; sb_protocol.eegnet_kwargs),
   `sample_rate` and `twindow` (the window's length from `tmin`) as hyperparameters.
 
@@ -60,6 +62,7 @@ values, and its training loss per epoch (mean and per cell).
 from __future__ import annotations
 
 import argparse
+import copy
 import math
 import time
 import traceback
@@ -126,6 +129,7 @@ PROTOCOL = dict(  # SpeechBrain-MOABB's
     selection="best",  # or "one_se"
     size="params",  # or "flops": the size one_se and multi_objective minimize
     multi_objective=False,
+    nested_by_test_session=False,  # True: one search per test session, on the folds that test on it
     final_train="train",  # the final evaluation trains on the trials it would have trained on; or "all"
     final_augment="speechbrain",
 )
@@ -150,9 +154,16 @@ def prepare(hp, recordings, cfg, args):
     X = protocol.crop(X, sample_rate, interval, hp["tmin"], tmax)
     X = X[:, recordings.channels(hp["n_steps_channel_selection"])]
     folds = protocol.leave_one_session_out(y, subjects, sessions, cfg["valid_ratio"])
+    if getattr(args, "test_session", None) is not None:  # a search nested by test session: its folds only
+        folds = testing_on(folds, args.test_session)
     X = torch.from_numpy(X).to(args.device)
     return dict(X=X, Xn=protocol.standardize(X), y=torch.from_numpy(y).to(args.device), folds=folds,
                 sessions=sessions, runs=runs, y_np=y, sample_rate=sample_rate)
+
+
+def testing_on(folds, session):
+    """The leave-one-session-out folds that test on ``session``; none of them trains or validates on it."""
+    return [f for f in folds if f[0].split("_test-", 1)[1] == session]
 
 
 def make_cells(data, seeds, settings, final=False):
@@ -501,7 +512,7 @@ def rerun(args, cfg, steps, settings, recordings, storage, paths, run):
         write_csv(args.out / f"rerun-{step}.csv", rows)
         write_csv(args.out / f"rerun-{step}-summary.csv", summary)
     paths += [args.out / f"rerun-{step}.csv", args.out / f"rerun-{step}-summary.csv"]
-    finish_run(run, summary, paths)
+    return summary
 
 
 def main():
@@ -524,6 +535,8 @@ def main():
     parser.add_argument("--rerun", metavar="STEP", help="rerun this step's best trials with new seeds, then stop")
     parser.add_argument("--rerun-top", type=int, default=10, help="with --rerun: how many of the best trials")
     parser.add_argument("--rerun-seeds", type=int, default=5, help="with --rerun: seeds per trial")
+    parser.add_argument("--test-session",
+                        help="only the folds that test on this session: one part of a search nested by test session")
     args = parser.parse_args()
     cfg = load_hparams(args.hparams, args.set)
     steps = steps_of(cfg)
@@ -533,14 +546,12 @@ def main():
         step, name = key.split(".", 1)
         parse_prior(prior)  # fail early
         steps[step]["search"][name] = prior
-    sf = args.optimizer == "schedule-free"
-    if sf:
+    if args.optimizer == "schedule-free":
         for step in steps.values():
             for name in cfg["schedule_free"]["not_searched"]:
                 step["search"].pop(name, None)
     torch.backends.cudnn.benchmark = True
-    trials_dir = args.out / "trials"
-    trials_dir.mkdir(parents=True, exist_ok=True)
+    args.out.mkdir(parents=True, exist_ok=True)
     tpe_seed = cfg["seed"] if args.tpe_seed is None else args.tpe_seed
     seed_base = cfg["seed"] if args.trial_seed is None else args.trial_seed
 
@@ -555,10 +566,48 @@ def main():
     print(f"{cfg['dataset']}: recordings of {len(recordings.subjects)} subjects loaded in {env['load_seconds']:.0f}s; "
           f"optimizer {args.optimizer}", flush=True)
 
-    storage = optuna.storages.JournalStorage(optuna.storages.journal.JournalFileBackend(str(args.out / "study.journal")))
+    sessions = [args.test_session]
+    if args.test_session is None and settings["nested_by_test_session"]:
+        sessions = sorted({session for by_session in recordings.raws.values() for session in by_session})
     optuna.logging.set_verbosity(optuna.logging.WARNING)
+    rows, summary = [], {}
+    for session in sessions:  # one search per held-out test session, or one over every fold
+        session_args = copy.copy(args)
+        session_args.test_session = session
+        if session is not None and args.test_session is None:
+            session_args.out = args.out / f"test-{session}"
+        prefix = "" if session is None else f"test-{session}/"
+        if session is not None:
+            print(f"selection nested by test session: {session}, in {session_args.out}", flush=True)
+        session_rows, session_summary = search(session_args, cfg, steps, settings, recordings, log, tpe_seed,
+                                               seed_base, paths, prefix)
+        rows += session_rows
+        summary.update(session_summary)
+    if len(sessions) > 1 and not args.rerun:  # every fold, each tested with a configuration chosen without its session
+        per_seed = [np.mean([r[f"test_{metric}"] for r in rows if r["seed"] == s])
+                    for s in dict.fromkeys(r["seed"] for r in rows)]
+        summary.update({f"final/test_{metric}": float(np.mean(per_seed)),
+                        f"final/test_{metric}_std": float(np.std(per_seed))})
+        print(f"final, every test session: test {metric} {np.mean(per_seed):.4f} ± {np.std(per_seed):.4f} "
+              f"over {len(per_seed)} seeds", flush=True)
+        write_csv(args.out / "final.csv", rows)
+        paths.append(args.out / "final.csv")
+    finish_run(run, rows, paths, summary)
+
+
+def search(args, cfg, steps, settings, recordings, log, tpe_seed, seed_base, paths, prefix=""):
+    """The search's steps and the final evaluation, in ``args.out``; returns the final rows and summary.
+
+    With ``args.test_session``, only the folds that test on that session: their training
+    and validation data never include it, so no trial tested on it helped choose the
+    configuration (selection nested by test session).
+    """
+    metric, sf, run = cfg["metric"], args.optimizer == "schedule-free", log.run
+    trials_dir = args.out / "trials"
+    trials_dir.mkdir(parents=True, exist_ok=True)
+    storage = optuna.storages.JournalStorage(optuna.storages.journal.JournalFileBackend(str(args.out / "study.journal")))
     if args.rerun:
-        return rerun(args, cfg, steps, settings, recordings, storage, paths, run)
+        return rerun(args, cfg, steps, settings, recordings, storage, paths, run), {}
     multi = settings["multi_objective"]
     hp = dict(cfg["fixed"])
     for step, step_settings in ([] if args.no_search else steps.items()):
@@ -615,7 +664,7 @@ def main():
                   f"{result['peak_allocated'] / 2**30:.1f} GiB; {size[0]} params, {size[1] / 1e6:.1f} MFLOPs; {values}",
                   flush=True)
             n_train = int(result["rows"][0]["n_train"])
-            log.trial(step, result, values, test, best, epoch_lr(trial_hp, args.optimizer, n_train), size)
+            log.trial(prefix + step, result, values, test, best, epoch_lr(trial_hp, args.optimizer, n_train), size)
         chosen, why = select(complete(), step_settings.get("selection", settings["selection"]), settings["size"])
         hp.update(chosen.user_attrs["values"])
         if sf:
@@ -644,15 +693,16 @@ def main():
     np.save(args.out / "final-losses.npy", result["losses"].numpy())
     (args.out / "final-hparams.yaml").write_text(yaml.safe_dump(hp, sort_keys=False))
     per_seed = [np.mean([r[f"test_{metric}"] for r in final_rows if r["seed"] == s]) for s in seeds]
-    summary = {f"final/test_{metric}": float(np.mean(per_seed)), f"final/test_{metric}_std": float(np.std(per_seed)),
-               "final/train_seconds": result["train_seconds"], "final/epoch": result["epoch"]}
-    print(f"final: test {metric} {np.mean(per_seed):.4f} ± {np.std(per_seed):.4f} over {len(seeds)} seeds "
+    summary = {f"final/{prefix}test_{metric}": float(np.mean(per_seed)),
+               f"final/{prefix}test_{metric}_std": float(np.std(per_seed)),
+               f"final/{prefix}train_seconds": result["train_seconds"], f"final/{prefix}epoch": result["epoch"]}
+    print(f"{prefix}final: test {metric} {np.mean(per_seed):.4f} ± {np.std(per_seed):.4f} over {len(seeds)} seeds "
           f"(per seed: {', '.join(f'{v:.4f}' for v in per_seed)}); {result['train_seconds']:.0f}s training", flush=True)
     if run is not None:
         for i, value in enumerate(per_seed):
-            run.log({"final_seed": i, f"final/test_{metric}": value})
+            run.log({"final_seed": i, f"final/{prefix}test_{metric}": value})
     paths += [args.out / name for name in ("final.csv", "final-curves.csv", "final-hparams.yaml")]
-    finish_run(run, final_rows, paths, summary)
+    return final_rows, summary
 
 
 def trial_summary(trial, metric):
