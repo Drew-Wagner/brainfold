@@ -31,6 +31,7 @@ per-member random draws for the augmentations.
 from __future__ import annotations
 
 import math
+import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 
@@ -69,8 +70,20 @@ class Recordings:
         self.n_classes, self.sample_rate, self.threads = n_classes, sample_rate, threads
         self.raws = self.dataset.get_data(self.subjects)
         first = next(iter(next(iter(self.raws.values())).values())).values()
-        self.info = next(iter(first)).copy().pick("eeg").info
+        raw = next(iter(first))
+        self.info = raw.copy().pick("eeg").info
+        self.channel_types = raw.get_channel_types()
         self._cache = {}
+
+    def structure(self):
+        """{subject: {session: [run, ...]}} in MOABB's (recording) order."""
+        return {subject: {session: list(by_run) for session, by_run in sessions.items()}
+                for subject, sessions in self.raws.items()}
+
+    def recording_rates(self):
+        """The raw recordings' sample rates (one value for most datasets)."""
+        return sorted({raw.info["sfreq"] for sessions in self.raws.values() for by_run in sessions.values()
+                       for raw in by_run.values()})
 
     def trials(self, fmin, fmax, sample_rate=None):
         """Trials (n, n_chans, n_times) float32, labels from 0, subjects and sessions.
@@ -134,6 +147,118 @@ class Recordings:
         return list(np.array(self.dataset.interval) - np.min(self.dataset.interval))
 
 
+# ---- version 2's rules from each dataset's metadata (PROTOCOL.md) ------------------------------------
+
+def protocol_window(paradigm, after_onset=0.5):
+    """(tmin, tmax) in seconds from MOABB's epoch start: the cue's offset to the end of imagery.
+
+    ``paradigm`` is the hparams file's ``paradigm`` block: ``cue_onset``, ``cue_offset``
+    (seconds, or "persists") and ``imagery_end``, all from MOABB's epoch start. If the cue
+    persists through the imagery, the window starts ``after_onset`` seconds after its
+    onset, past the main visual evoked response.
+    """
+    onset, offset, end = paradigm["cue_onset"], paradigm["cue_offset"], paradigm["imagery_end"]
+    tmin = onset + after_onset if offset == "persists" else offset
+    if not tmin < end:
+        raise ValueError(f"empty window: from {tmin} s to the end of imagery at {end} s")
+    return float(tmin), float(end)
+
+
+def cue_window(paradigm, after_onset=0.5):
+    """(tmin, tmax) of the cue period: onset to offset, or onset to ``after_onset`` s if the cue persists."""
+    onset, offset = paradigm["cue_onset"], paradigm["cue_offset"]
+    return float(onset), float(onset + after_onset if offset == "persists" else offset)
+
+
+def check_paradigm(paradigm, recordings, sample_rate, fmin, fmax):
+    """Raise if the ``paradigm`` block disagrees with MOABB's metadata, or the band or rate isn't possible.
+
+    Checks what the block states (a missing or null entry isn't checked): sessions per
+    subject, runs per session, the recording rate, the numbers of EEG and EOG channels;
+    and that the window fits in MOABB's epoch, ``fmax`` is below the Nyquist frequency of
+    ``sample_rate``, and the band is within the hardware filters (``hardware_band``).
+    """
+    problems = []
+    structure = recordings.structure()
+
+    def differs(key, observed):
+        stated = paradigm.get(key)
+        if stated is not None and set(observed) != {stated}:
+            problems.append(f"{key}: the paradigm block says {stated}, MOABB has {sorted(set(observed))}")
+
+    differs("sessions", [len(sessions) for sessions in structure.values()])
+    differs("runs_per_session", [len(runs) for sessions in structure.values() for runs in sessions.values()])
+    differs("recording_rate", recordings.recording_rates())
+    differs("eeg_channels", [recordings.channel_types.count("eeg")])
+    differs("eog_channels", [recordings.channel_types.count("eog")])
+    length = float(np.ptp(recordings.dataset.interval))
+    for name, (tmin, tmax) in (("window", protocol_window(paradigm)), ("cue period", cue_window(paradigm))):
+        if not 0 <= tmin < tmax <= length:
+            problems.append(f"the {name} {tmin}-{tmax} s isn't within MOABB's epoch of {length} s")
+    if fmax >= sample_rate / 2:
+        problems.append(f"fmax {fmax} Hz isn't below the Nyquist frequency of {sample_rate} Hz")
+    low, high = paradigm.get("hardware_band") or (0, math.inf)
+    if fmin < low or fmax > high:
+        problems.append(f"the band {fmin}-{fmax} Hz isn't within the hardware filters' {low}-{high} Hz")
+    if problems:
+        raise ValueError("the paradigm block or the protocol's preprocessing doesn't fit the dataset:\n  "
+                         + "\n  ".join(problems))
+
+
+def electrode_row(name):
+    """The 10-20 (10-10, 10-5) row of an electrode name: "Fp" for Fp1, "AF" for AFz, "F" for Fz, "FC" for FC3."""
+    return name.rstrip("0123456789hzZ")  # 10-5 names such as FFC3h end in h
+
+
+def without_rows(names, rows=("Fp", "AF", "F")):
+    """Indices of the channels whose 10-20 row isn't one of ``rows`` (case-insensitive)."""
+    rows = {r.lower() for r in rows}
+    return np.array([i for i, name in enumerate(names) if electrode_row(name).lower() not in rows])
+
+
+def pseudo_sessions(subjects, sessions, runs):
+    """Sessions for leave-one-session-out, with every subject's single session split in two.
+
+    A subject recorded in one session gets two pseudo-sessions, ``<session>-half1`` and
+    ``<session>-half2``: its runs in two contiguous halves (the first half has the extra
+    run of an odd number), or, with a single run, its trials in two contiguous halves in
+    time. Subjects with two or more sessions keep them. Trials are in recording order.
+    """
+    out = np.array(sessions, dtype=object)
+    for subject in np.unique(subjects):
+        idx = np.flatnonzero(subjects == subject)
+        names = np.unique(sessions[idx])
+        if len(names) > 1:
+            continue
+        order = list(dict.fromkeys(runs[idx].tolist()))
+        if len(order) > 1:
+            first = set(np.array_split(np.array(order, dtype=object), 2)[0].tolist())
+            half = np.where(np.isin(runs[idx], list(first)), 1, 2)
+        else:
+            half = np.repeat([1, 2], [len(a) for a in np.array_split(idx, 2)])
+        out[idx] = [f"{names[0]}-half{h}" for h in half]
+    return out.astype(str)
+
+
+def outer_session_names(structure):
+    """The test sessions of leave-one-session-out with ``pseudo_sessions``, from {subject: {session: runs}}."""
+    names = set()
+    for sessions in structure.values():
+        names |= set(sessions) if len(sessions) > 1 else {f"{s}-half{h}" for s in sessions for h in (1, 2)}
+    return sorted(names)
+
+
+def binomial_threshold(n, n_classes, alpha=0.05):
+    """The accuracy that n trials must exceed to be above chance at level ``alpha`` (Combrisson and Jerbi, 2015).
+
+    Their binoinv(1 - alpha, n, 1 / n_classes) / n: an accuracy above it has P <= alpha
+    under the binomial of guessing.
+    """
+    from scipy.stats import binom
+
+    return float(binom.ppf(1 - alpha, n, 1 / n_classes)) / n
+
+
 def crop(X, sample_rate, interval_in, tmin, tmax):
     """SpeechBrain-MOABB's crop_signals: nearest samples to tmin (included) and tmax (excluded)."""
     if [tmin, tmax] == list(interval_in):
@@ -156,14 +281,14 @@ def leave_one_session_out(y, subjects, sessions, valid_ratio):
                     picks = np.floor(np.linspace(0, len(of_class) - 1, round(valid_ratio * len(of_class)))).astype(int)
                     valid.extend(of_class[picks])
                 train.extend(idx)
-            valid = np.array(valid)
-            train = np.setdiff1d(np.array(train), valid)
+            valid = np.array(valid, dtype=int)
+            train = np.setdiff1d(np.array(train, dtype=int), valid)
             test = np.flatnonzero((subjects == subject) & (sessions == test_session))
             folds.append((f"sub{subject:02d}_test-{test_session}", train, valid, test))
     return folds
 
 
-def inner_folds(pool, y, sessions, runs, k, by_run):
+def inner_folds(pool, y, sessions, runs, k, by_run, max_folds=6, min_runs=3, n_blocks=5):
     """k (train, valid) splits of the training trials ``pool``, each trial validated once.
 
     ``by_run``: each validation set is whole runs, consecutive in recording order
@@ -171,9 +296,19 @@ def inner_folds(pool, y, sessions, runs, k, by_run):
     temporally separate from training, as a test session is; k "runs" is one fold per
     run. Otherwise, the k-fold version of SpeechBrain-MOABB's split: every k-th trial of
     each class, in time order.
+
+    k "rule" is version 2's (PROTOCOL.md, ``by_run`` ignored): one fold per run of the
+    training data, consecutive runs grouped so there are at most ``max_folds``; with fewer
+    than ``min_runs`` runs, ``n_blocks`` contiguous blocks of trials in time.
     """
     pool = np.sort(pool)
     fold_of = np.empty(len(pool), dtype=int)
+    if k == "rule":
+        n_runs = len(dict.fromkeys((sessions[i], runs[i]) for i in pool))
+        if n_runs < min_runs:
+            fold_of[:] = np.repeat(np.arange(n_blocks), [len(b) for b in np.array_split(pool, n_blocks)])
+            return [(pool[fold_of != j], pool[fold_of == j]) for j in range(n_blocks)]
+        k, by_run = min(n_runs, max_folds), True
     if by_run:
         group = [(sessions[i], runs[i]) for i in pool]
         names = list(dict.fromkeys(group))
@@ -515,7 +650,7 @@ def cyclic_lr(base_lr, max_lr, step_size):
 
 
 def fit(model, X, Xn, y, train_idx, seeds, hp, optimizer="adam", aug=None, eval_epochs=(), on_eval=None,
-        compile=False, eeg_aug=None, sample_rate=None):
+        compile=False, eeg_aug=None, sample_rate=None, epoch_seconds=None):
     """Train every member of ``model`` as SpeechBrain-MOABB trains one fold.
 
     X (n, C, T) are the trials, Xn the same standardized; member k trains on
@@ -525,7 +660,9 @@ def fit(model, X, Xn, y, train_idx, seeds, hp, optimizer="adam", aug=None, eval_
     ``mixup_alpha``; these replace the standardized trials rather than adding augmented
     copies (as braindecode's AugmentedDataLoader), with every draw member k's own, from
     ``seeds[k]``. ``on_eval(epoch, model)`` is called after each epoch in ``eval_epochs``,
-    with the model ready to evaluate; training then continues unchanged.
+    with the model ready to evaluate; training then continues unchanged. A list
+    ``epoch_seconds`` gets each epoch's training time, without evaluations (from CUDA
+    events on a GPU, so no synchronization per epoch).
     Returns the final model and the members' mean training loss per epoch, (epochs, K).
     """
     epochs, lr, batch_size = hp["number_of_epochs"], hp["lr"], hp["batch_size"]
@@ -600,7 +737,10 @@ def fit(model, X, Xn, y, train_idx, seeds, hp, optimizer="adam", aug=None, eval_
     average = None  # running sum of the last avg_models epochs' state
     epoch_losses = torch.zeros(epochs, K, device=device)
     step = 0
+    timer = _EpochTimer(device) if epoch_seconds is not None else None
     for epoch in range(epochs):
+        if timer:
+            timer.start()
         model.train()
         order = torch.stack([torch.randperm(n_train, device=device, generator=g) for g in generators])
         for i in range(0, n_train, batch_size):
@@ -621,6 +761,8 @@ def fit(model, X, Xn, y, train_idx, seeds, hp, optimizer="adam", aug=None, eval_
             opt.step()
             step += 1
             epoch_losses[epoch] += losses.detach() * (idx.shape[0] / (2 if aug else 1)) / n_train
+        if timer:
+            timer.stop()
         if epoch >= epochs - avg_models:
             state = [t.detach().clone().float() for t in model.state_dict().values()]
             average = state if average is None else [a + s for a, s in zip(average, state)]
@@ -637,7 +779,35 @@ def fit(model, X, Xn, y, train_idx, seeds, hp, optimizer="adam", aug=None, eval_
     model.eval()
     if on_eval and epochs in eval_epochs:
         on_eval(epochs, model)
+    if timer:
+        epoch_seconds.extend(timer.seconds())
     return model, epoch_losses.cpu()
+
+
+class _EpochTimer:
+    """Each epoch's time: CUDA events read once at the end on a GPU, else the wall clock."""
+
+    def __init__(self, device):
+        self.cuda, self.marks = device.type == "cuda", []
+
+    def _now(self):
+        if not self.cuda:
+            return time.perf_counter()
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        return event
+
+    def start(self):
+        self.marks.append([self._now(), None])
+
+    def stop(self):
+        self.marks[-1][1] = self._now()
+
+    def seconds(self):
+        if not self.cuda:
+            return [b - a for a, b in self.marks]
+        torch.cuda.synchronize()
+        return [a.elapsed_time(b) / 1000 for a, b in self.marks]
 
 
 METRICS = {

@@ -42,6 +42,14 @@ as before; the hparams files under hparams/sb_moabb/improved/ turn them on):
   `final_train: all` and `final_augment`.
 - Kernel and pool sizes in seconds (`cnn_temporal_kernel_s`, ...; sb_protocol.eegnet_kwargs),
   `sample_rate` and `twindow` (the window's length from `tmin`) as hyperparameters.
+- Version 2 (PROTOCOL.md; hparams/sb_moabb/v2/): `protocol.window: paradigm` (tmin and
+  tmax from the dataset's `paradigm` block, the sample rate at most the recording's,
+  and the block checked against MOABB's metadata), `channels: all` (every EEG
+  channel), `outer_folds: rule` (one session split into two pseudo-sessions),
+  `inner_folds: rule` (one fold per run, at most 6; 5 blocks in time with fewer than
+  3 runs); per step, `size: n_transforms` (the one-SE rule counts the augmentations
+  on) and `first_trial: all_off` (the first trial has no augmentation). sb_audit.py
+  runs the confound audit.
 
 A trial's unit of work is a cell, one (outer fold, inner fold, seed): `make_cells`
 lists a trial's cells and `train_cells` trains any list of them in packs, so an
@@ -132,6 +140,10 @@ PROTOCOL = dict(  # SpeechBrain-MOABB's
     nested_by_test_session=False,  # True: one search per test session, on the folds that test on it
     final_train="train",  # the final evaluation trains on the trials it would have trained on; or "all"
     final_augment="speechbrain",
+    # version 2 (PROTOCOL.md), each off by default:
+    window="hparams",  # or "paradigm": tmin and tmax from the `paradigm` block, and the sample rate at most the recording's
+    channels="adjacency",  # or "all": every EEG channel (EOG dropped), no selection around Cz
+    outer_folds="sessions",  # or "rule": a subject's single session split into two pseudo-sessions
 )
 
 
@@ -144,21 +156,37 @@ def trial_seeds(base, n, number, per_trial):
 
 # ---- one trial: every cell, packed -----------------------------------------------------------------
 
-def prepare(hp, recordings, cfg, args):
-    """The trial's data on the device, its sample rate and its leave-one-session-out folds."""
+def prepare(hp, recordings, cfg, args, settings=PROTOCOL):
+    """The trial's data on the device, its sample rate and its leave-one-session-out folds.
+
+    ``hp["drop_rows"]``, a list of 10-20 rows (e.g. Fp, AF, F), drops those channels (the audit).
+    """
     sample_rate = hp.get("sample_rate", cfg["sample_rate"])
     X, y, subjects, sessions = recordings.trials(hp["fmin"], hp["fmax"], sample_rate)
     runs = recordings.runs(hp["fmin"], hp["fmax"], sample_rate)
+    if settings["outer_folds"] == "rule":
+        sessions = protocol.pseudo_sessions(subjects, sessions, runs)
+    elif settings["outer_folds"] != "sessions":
+        raise ValueError(f"unknown outer_folds {settings['outer_folds']!r}")
     interval = recordings.interval()
     tmax = min(hp["tmin"] + hp["twindow"], interval[1]) if "twindow" in hp else hp["tmax"]
     X = protocol.crop(X, sample_rate, interval, hp["tmin"], tmax)
-    X = X[:, recordings.channels(hp["n_steps_channel_selection"])]
+    names = list(recordings.info.ch_names)
+    if settings["channels"] == "adjacency":
+        keep = recordings.channels(hp["n_steps_channel_selection"])
+    elif settings["channels"] == "all":
+        keep = np.arange(len(names))
+    else:
+        raise ValueError(f"unknown channels {settings['channels']!r}")
+    if hp.get("drop_rows"):
+        keep = np.intersect1d(keep, protocol.without_rows(names, hp["drop_rows"]))
+    X = X[:, keep]
     folds = protocol.leave_one_session_out(y, subjects, sessions, cfg["valid_ratio"])
     if getattr(args, "test_session", None) is not None:  # a search nested by test session: its folds only
         folds = testing_on(folds, args.test_session)
     X = torch.from_numpy(X).to(args.device)
     return dict(X=X, Xn=protocol.standardize(X), y=torch.from_numpy(y).to(args.device), folds=folds,
-                sessions=sessions, runs=runs, y_np=y, sample_rate=sample_rate)
+                sessions=sessions, runs=runs, y_np=y, sample_rate=sample_rate, channels=[names[i] for i in keep])
 
 
 def testing_on(folds, session):
@@ -234,6 +262,7 @@ def train_cells(cells, hp, data, cfg, args, label, eval_epochs):
     aug, eeg_aug = augmentation(hp, hp.get("augment", "none"), data["sample_rate"])
     kwargs = protocol.eegnet_kwargs(hp, X.shape[1], cfg["n_classes"], X.shape[2], data["sample_rate"])
     rows, curves, losses, timing = [], [], [], dict(train_seconds=0.0, oom_seconds=0.0, peak_allocated=0, n_packs=0)
+    epoch_seconds = []  # each epoch's training time, summed over packs
 
     limit = [len(cells)]  # the largest pack that fitted in memory so far
 
@@ -255,11 +284,13 @@ def train_cells(cells, hp, data, cfg, args, label, eval_epochs):
             torch._dynamo.reset()
         peak_memory(device)
         t = time.perf_counter()
+        pack_epoch_seconds = []
         try:
             model = protocol.build(kwargs, pack_seeds, device)
             _, member_losses = protocol.fit(model, X, Xn, y, train_idx, pack_seeds, hp, optimizer=args.optimizer,
                                             aug=aug, eval_epochs=eval_epochs, on_eval=on_eval, compile=args.compile,
-                                            eeg_aug=eeg_aug, sample_rate=data["sample_rate"])
+                                            eeg_aug=eeg_aug, sample_rate=data["sample_rate"],
+                                            epoch_seconds=pack_epoch_seconds)
         except torch.OutOfMemoryError:
             if len(pack) == 1:
                 raise
@@ -275,6 +306,8 @@ def train_cells(cells, hp, data, cfg, args, label, eval_epochs):
             train_pack(pack[limit[0] :])
             return
         timing["train_seconds"] += time.perf_counter() - t
+        epoch_seconds[:] = [a + b for a, b in zip(epoch_seconds, pack_epoch_seconds)] if epoch_seconds else \
+            pack_epoch_seconds
         timing["peak_allocated"] = max(timing["peak_allocated"], peak_memory(device)[0] or 0)
         timing["n_packs"] += 1
         losses.append(member_losses)
@@ -289,7 +322,7 @@ def train_cells(cells, hp, data, cfg, args, label, eval_epochs):
 
     for pack in pack_cells(cells, cfg["pack_size"]):
         train_pack(pack)
-    return curves, rows, torch.cat(losses, 1), timing
+    return curves, rows, torch.cat(losses, 1), dict(timing, epoch_seconds=epoch_seconds)
 
 
 class InvalidConfiguration(Exception):
@@ -317,7 +350,7 @@ def run_trial(hp, seeds, recordings, cfg, args, label, settings=PROTOCOL, final=
         eval_epochs = [hp["number_of_epochs"]]
 
     t0 = time.perf_counter()
-    data = prepare(hp, recordings, cfg, args)
+    data = prepare(hp, recordings, cfg, args, settings)
     try:
         size = protocol.model_size(protocol.eegnet_kwargs(hp, data["X"].shape[1], cfg["n_classes"], data["X"].shape[2],
                                                           data["sample_rate"]))
@@ -342,7 +375,7 @@ def run_trial(hp, seeds, recordings, cfg, args, label, settings=PROTOCOL, final=
     summary = summarize(rows, metric)
     return dict(rows=rows, curves=curves, losses=losses, objective=mean_valid.get(chosen, float("nan")), epoch=chosen,
                 mean_valid=mean_valid, data_seconds=data_seconds, n_cells=len(cells), params=size[0], flops=size[1],
-                **summary, **timing)
+                n_channels=len(data["channels"]), n_times=data["X"].shape[2], **summary, **timing)
 
 
 def summarize(rows, metric):
@@ -399,12 +432,26 @@ def read_csv(path):
         return list(csv.DictReader(f))
 
 
+def n_transforms(values):
+    """How many augmentations a trial's values turn on: the ``aug_*_p`` probabilities above 0."""
+    return sum(1 for k, v in values.items() if k.startswith("aug_") and k.endswith("_p") and v > 0)
+
+
+def size_of(trial, size):
+    """A trial's size for the one-standard-error rule: ``params``, ``flops`` or ``n_transforms``."""
+    if size == "n_transforms":
+        return n_transforms(trial.user_attrs["values"])
+    return trial.user_attrs[size]
+
+
 def select(trials, rule, size):
     """The trial to keep from a step's finished trials, and why.
 
-    ``best``: the highest objective. ``one_se``: the smallest (``size``: params or
-    flops) whose objective is within one standard error of the best's (Breiman et al.,
-    1984; Hastie et al., 2009, section 7.10), the best when its standard error is unknown.
+    ``best``: the highest objective. ``one_se``: the smallest (``size``: params, flops
+    or n_transforms) whose objective is within one standard error of the best's (Breiman
+    et al., 1984; Hastie et al., 2009, section 7.10), the best when its standard error is
+    unknown; ties in size go to the higher objective. With ``n_transforms``, no
+    augmentation is kept unless augmentation beats it by more than one standard error.
     """
     best = max(trials, key=lambda t: t.values[0])
     se = best.user_attrs.get("se", float("nan"))
@@ -413,8 +460,35 @@ def select(trials, rule, size):
     if rule != "one_se":
         raise ValueError(f"unknown selection {rule!r}")
     within = [t for t in trials if t.values[0] >= best.values[0] - se]
-    chosen = min(within, key=lambda t: (t.user_attrs[size], -t.values[0]))
+    chosen = min(within, key=lambda t: (size_of(t, size), -t.values[0]))
     return chosen, f"one_se: smallest {size} of {len(within)} trials within {se:.4f} of trial {best.number}"
+
+
+def first_trial(step_settings):
+    """The values to enqueue as a step's first trial, or None: ``first_trial: all_off`` sets every
+    searched ``aug_*_p`` to 0 (no augmentation; TPE samples the rest, which then have no effect)."""
+    kind = step_settings.get("first_trial")
+    if kind is None:
+        return None
+    if kind != "all_off":
+        raise ValueError(f"unknown first_trial {kind!r}")
+    values = {k: 0.0 for k in step_settings["search"] if k.startswith("aug_") and k.endswith("_p")}
+    if not values:
+        raise ValueError("first_trial: all_off, but the step searches no aug_*_p")
+    return values
+
+
+def enqueue_first(study, values):
+    """Enqueue ``values`` unless a finished or waiting trial already has them (so a resumed search doesn't redo it)."""
+    if values is None:
+        return False
+    states = (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.WAITING)
+    for t in study.get_trials(deepcopy=False, states=states):
+        params = t.params if t.state == optuna.trial.TrialState.COMPLETE else t.system_attrs.get("fixed_params", {})
+        if all(params.get(k) == v for k, v in values.items()):
+            return False
+    study.enqueue_trial(values)
+    return True
 
 
 class Logger:
@@ -427,6 +501,7 @@ class Logger:
             run.define_metric("epoch")
             run.define_metric("train_loss*", step_metric="epoch")
             run.define_metric("lr", step_metric="epoch")
+            run.define_metric("epoch_seconds", step_metric="epoch")
             run.define_metric("final_seed")
             run.define_metric("final/*", step_metric="final_seed")
 
@@ -434,9 +509,11 @@ class Logger:
         if self.run is None:
             return
         self.run.define_metric(f"{step}/*", step_metric="trial")
+        seconds = result.get("epoch_seconds") or []
         for epoch, loss in enumerate(result["losses"].tolist()):  # training loss per member and mean
             self.epochs += 1
-            self.run.log({"epoch": self.epochs, "train_loss": float(np.mean(loss)), "lr": lr(epoch),
+            timed = {"epoch_seconds": seconds[epoch]} if epoch < len(seconds) else {}
+            self.run.log({"epoch": self.epochs, "train_loss": float(np.mean(loss)), "lr": lr(epoch), **timed,
                           **{f"train_loss/member{k}": v for k, v in enumerate(loss)}})
         self.trials += 1
         m = self.metric
@@ -449,6 +526,8 @@ class Logger:
             extra.update({f"{step}/valid_{m}_inner/{j}": v for j, v in result["per_inner"].items()})
         if size is not None:
             extra.update({f"{step}/params": size[0], f"{step}/mflops": size[1] / 1e6})
+        if any(k.startswith("aug_") for k in values):
+            extra[f"{step}/n_transforms"] = n_transforms(values)
         self.run.log({"trial": self.trials, f"{step}/valid_{m}": result["objective"], f"{step}/best_valid_{m}": best,
                       f"{step}/test_{m}": test, f"{step}/epoch": result["epoch"],
                       f"{step}/train_seconds": result["train_seconds"], f"{step}/data_seconds": result["data_seconds"],
@@ -457,6 +536,36 @@ class Logger:
                       f"{step}/n_packs": result["n_packs"],
                       **{f"{step}/mean_valid_{m}_at/{e}": v for e, v in result["mean_valid"].items()},
                       **{f"{step}/param/{k}": v for k, v in values.items()}, **extra})
+
+
+def apply_paradigm(cfg, settings, recordings):
+    """Version 2's preprocessing rules from the dataset's ``paradigm`` block (PROTOCOL.md), with ``window: paradigm``.
+
+    The window from the cue's offset (or 0.5 s after its onset, if it persists) to the end
+    of imagery goes into ``fixed`` as tmin and tmax; the sample rate is ``sample_rate`` or
+    the recording's, if lower; the block is checked against MOABB's metadata. Returns what
+    it set, or None with ``window: hparams`` (the window then comes from the hyperparameters).
+    """
+    if settings["window"] == "hparams":
+        return None
+    if settings["window"] != "paradigm":
+        raise ValueError(f"unknown window {settings['window']!r}")
+    paradigm, fixed = cfg["paradigm"], cfg["fixed"]
+    rate = min(cfg["sample_rate"], min(recordings.recording_rates()))
+    cfg["sample_rate"] = recordings.sample_rate = rate
+    protocol.check_paradigm(paradigm, recordings, rate, fixed["fmin"], fixed["fmax"])
+    tmin, tmax = protocol.protocol_window(paradigm)
+    fixed.pop("twindow", None)
+    fixed.update(tmin=tmin, tmax=tmax)
+    return dict(sample_rate=rate, tmin=tmin, tmax=tmax, fmin=fixed["fmin"], fmax=fixed["fmax"],
+                cue_persists=paradigm["cue_offset"] == "persists")
+
+
+def held_out_sessions(recordings, settings):
+    """The test sessions of leave-one-session-out (pseudo-sessions for one-session subjects with ``outer_folds: rule``)."""
+    if settings["outer_folds"] == "rule":
+        return protocol.outer_session_names(recordings.structure())
+    return sorted({session for by_session in recordings.raws.values() for session in by_session})
 
 
 def epoch_lr(hp, optimizer, n_train):
@@ -557,8 +666,9 @@ def main():
 
     t0 = time.perf_counter()
     recordings = protocol.Recordings(cfg["dataset"], cfg["n_classes"], cfg["sample_rate"], subjects=args.subjects)
+    rules = apply_paradigm(cfg, settings, recordings)
     env = dict(environment(args.device), load_seconds=time.perf_counter() - t0, optimizer=args.optimizer,
-               tpe_seed=tpe_seed, trial_seed=seed_base)
+               tpe_seed=tpe_seed, trial_seed=seed_base, **(rules or {}))
     paths = [write_environment(args.out / "results", env)]
     run = start_run(args.wandb, "sb-protocol", args.hparams, cfg, args, env)
     log = Logger(run, cfg["metric"])
@@ -566,9 +676,11 @@ def main():
     print(f"{cfg['dataset']}: recordings of {len(recordings.subjects)} subjects loaded in {env['load_seconds']:.0f}s; "
           f"optimizer {args.optimizer}", flush=True)
 
+    if rules:
+        print(f"version 2's preprocessing: {rules}", flush=True)
     sessions = [args.test_session]
     if args.test_session is None and settings["nested_by_test_session"]:
-        sessions = sorted({session for by_session in recordings.raws.values() for session in by_session})
+        sessions = held_out_sessions(recordings, settings)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     rows, summary = [], {}
     for session in sessions:  # one search per held-out test session, or one over every fold
@@ -617,6 +729,8 @@ def search(args, cfg, steps, settings, recordings, log, tpe_seed, seed_base, pat
                                     sampler=sampler, directions=["maximize", "minimize"] if multi else ["maximize"],
                                     load_if_exists=True)
         stale_trials_failed(study)
+        if enqueue_first(study, first_trial(step_settings)):
+            print(f"{step}: the first trial has every transform off", flush=True)
         complete = lambda: study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,))
         failed = 0
         while len(complete()) < step_settings.get("trials", cfg["trials"]):
@@ -665,7 +779,8 @@ def search(args, cfg, steps, settings, recordings, log, tpe_seed, seed_base, pat
                   flush=True)
             n_train = int(result["rows"][0]["n_train"])
             log.trial(prefix + step, result, values, test, best, epoch_lr(trial_hp, args.optimizer, n_train), size)
-        chosen, why = select(complete(), step_settings.get("selection", settings["selection"]), settings["size"])
+        chosen, why = select(complete(), step_settings.get("selection", settings["selection"]),
+                             step_settings.get("size", settings["size"]))
         hp.update(chosen.user_attrs["values"])
         if sf:
             hp["chosen_epochs"] = chosen.user_attrs["epoch"]
@@ -713,6 +828,8 @@ def trial_summary(trial, metric):
                 flops=attrs.get("flops"), train_seconds=attrs.get("train_seconds"),
                 **{f"valid_seed{i}": v for i, v in enumerate(attrs.get("per_seed", {}).values())},
                 **{f"valid_inner{j}": v for j, v in attrs.get("per_inner", {}).items()},
+                **({"n_transforms": n_transforms(attrs["values"])}
+                   if any(k.startswith("aug_") for k in attrs.get("values", {})) else {}),
                 **attrs.get("values", {}))
 
 
