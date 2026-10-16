@@ -6,8 +6,10 @@ On a new dataset the protocol runs from scratch: it searches again and
 chooses its own configuration. What has to generalize is the procedure, not
 the configuration it found on BNCI2014001.
 
-Status: draft, 2026-10-16, not implemented; the spec was first committed at
-d7e4159. The log below gives the commit each variant ran. Version 1 (the "improved
+Status: draft, 2026-10-16; the spec was first committed at d7e4159 and
+implemented at 49331e0 and dd80594 (`hparams/sb_moabb/v2/bnci2014001_eegnet.yaml`,
+`sb_audit.py`, `cluster/drac/sb_v2.sbatch`; the README's "Version 2 of the
+protocol" has the commands and measured costs). Not run yet. The log below gives the commit each variant ran. Version 1 (the "improved
 protocol", `hparams/sb_moabb/improved/bnci2014001_eegnet.yaml`) is running as
 job 65435553. `PROTOCOL_IDEAS.md` keeps the ideas and their implementation
 notes; this file is the protocol itself, the rules for changing it, and the
@@ -55,6 +57,17 @@ anything is run on it, and committed with the protocol.
 | Montage positions | 22 EEG channels, 10-20 | Audit |
 | EOG channels | 3 (dropped) | Dropped |
 
+Implementation choice: the table is the hparams file's `paradigm` block
+(`cue_onset`, `cue_offset` or `persists`, `imagery_end`, `sessions`,
+`runs_per_session`, `recording_rate`, `hardware_band`, `montage`,
+`eeg_channels`, `eog_channels`). Where MOABB has the same information
+(sessions per subject, runs per session, recording rate, EEG and EOG channel
+counts), the code compares them and stops on any difference, rather than
+warning; a null entry isn't checked. The hardware filters and the montage's
+system aren't in MOABB's metadata (BNCI2014001's raw files say 0-125 Hz), so
+they come from the table only. The splits themselves are computed from
+MOABB's subject, session and run metadata, never from the table.
+
 Held-out candidates (from `PROTOCOL_IDEAS.md`): BNCI2014004, Cho2017,
 PhysionetMI, Zhou2016, Schirrmeister2017. Their tables are filled before the
 freeze, so a dataset the rules can't handle shows up before any result does.
@@ -96,6 +109,17 @@ The rules:
   Cz's neighbours depends on the montage.
 - **Normalization:** each trial z-scored over time per channel, as now.
 
+Implementation choices:
+
+- The protocol stops before training if the band isn't possible: `fmax` at
+  or above the Nyquist frequency of the sample rate, or the band outside the
+  table's hardware filters. The spec only says the table "checks" them; a
+  dataset that fails needs a protocol decision, not a silent fallback.
+- "The recording rate if lower" is the lowest rate among the subjects' raw
+  files.
+- The window is cropped as SpeechBrain-MOABB's `crop_signals`: the nearest
+  samples, `tmax` excluded (1.25-4.0 s is 343 samples at 125 Hz).
+
 The cost is accuracy: excluding the cue period and the slow band will likely
 score below SpeechBrain-MOABB on BNCI2014001. How much of their accuracy the
 cue period explains is what the audit measures.
@@ -113,6 +137,14 @@ As version 1 except where noted.
   number of transforms on, so no augmentation wins unless augmentation is
   better by more than one standard error. (Their protocol kept step 2's best
   even when it was worse than training without augmentation.)
+
+  Implementation choices: the enqueued trial sets every searched `aug_*_p`
+  to 0 and lets the sampler draw the magnitudes, which then have no effect;
+  it counts as one of the 20 random startup trials. A resumed search doesn't
+  enqueue it again if a finished or waiting trial already has it (an
+  interrupted one is redone). Ties in the number of transforms go to the
+  higher validation score; any trial with every transform off counts as no
+  augmentation.
 - **Epochs:** schedule-free AdamW; the epoch is chosen on validation from
   250-1000 in steps of 25.
 - **Seeds:** a different seed per inner fold and per trial.
@@ -132,6 +164,18 @@ As version 1 except where noted.
   New in version 2: version 1 fell back to interleaved folds, which aren't
   separate in time from training.
 
+Implementation choices:
+
+- One session: the pseudo-sessions are named `<session>-half1` and
+  `<session>-half2`; with an odd number of runs (or trials, for one run), the
+  first half has the extra one. Each subject is split on its own, so a
+  dataset where some subjects have two sessions keeps theirs.
+- Runs are counted over all the training data (each (session, run) pair),
+  in recording order; grouping into at most 6 folds splits them as evenly as
+  `numpy.array_split` (earlier folds get the extra run). The 5 blocks in time
+  are `numpy.array_split` of the training trials in recording order (across
+  the training sessions, if more than one).
+
 ## The confound audit
 
 Run on every dataset before the search, reported, never used for selection.
@@ -148,6 +192,33 @@ Accuracy well above chance on 2 says the cue's evoked response or eye
 movements carry the class; a large drop from 1 to 3 says frontal (possibly
 ocular) activity does. The report states both against the binomial threshold
 for the number of trials (Combrisson and Jerbi, 2015).
+
+Implementation choices (`sb_audit.py`):
+
+- "The step 1 defaults of version 1" are version 1's `fixed` values, the
+  reference model of its step 0: EEGNet-8,2, dropout 0.5, learning rate
+  0.001, batches of 32, with schedule-free as the search uses.
+- The model trains to a fixed epoch, the last of the schedule-free grid
+  (1000), and is scored there: choosing the epoch on the same validation
+  folds would bias the accuracy upwards, and the binomial threshold assumes
+  no such choice.
+- "Starting Fp, AF or F" is read as the 10-20 row, the letters before the
+  number or `z`: Fp1, AF3, F3 and Fz are frontal; FC and FT (fronto-central
+  and fronto-temporal rows) are kept. Listing Fp next to F only makes sense
+  for rows (as string prefixes, F would cover Fp). On BNCI2014001 this drops
+  Fz only, so condition 3 tests little there; the rows are
+  `audit.frontal_rows` in the hparams file.
+- It covers every outer fold (all subjects and test sessions, not nested),
+  and each condition shares the seeds. The threshold's number of trials is
+  the validation predictions per seed: every training trial once per outer
+  fold it trains in, which is once with two sessions; with three or more,
+  a trial is counted once per outer fold, which makes the threshold
+  optimistic. Thresholds are given pooled and per subject; the drop from 1 to
+  3 is the mean over subjects with its paired standard error. Test-session
+  scores, computed as in any trial, are dropped.
+- It writes `audit.csv`, `audit-cells.csv` and `audit.md` to its `--out`;
+  `cluster/drac/sb_v2.sbatch` runs it once per dataset, in task 0, into
+  `<config>-audit/` next to the replicate searches' `<config>-r<n>/`.
 
 ## Comparison on the held-out datasets (to settle before the freeze)
 
@@ -172,7 +243,7 @@ A draft; nothing below is run yet.
 | 1 | SpeechBrain-MOABB's protocol, Adam | 1e4ea9e (tag `protocol-sb-repro`) | 65405367_0 | 0.729 ± 0.007 test (10 seeds), 11.8k parameters, 3 h 02 min | Not exactly theirs: BatchNorm momentum searched (they fix 0.01) |
 | 2 | SpeechBrain-MOABB's protocol, schedule-free | 1e4ea9e (tag `protocol-sb-repro`) | 65405367_1 | 0.707 ± 0.003 test, 53.7k parameters, 6 h 01 min | Step 2 kept augmentation that lowered validation |
 | 3 | Version 1 (step 0 searched), replicate 0 | a0c5b53 (tag `protocol-v1`) | 65435553 | Running | Step 0 chose fmin 2.4-2.6 Hz, tmin 0.2 s |
-| 4 | Version 2 | Spec d7e4159; code not yet written | Not run | | This draft |
+| 4 | Version 2 | Spec d7e4159; code 49331e0, dd80594 | Not run | | This draft. The audit was run once locally (RTX 4080 SUPER, 2026-10-16), for its cost: validation accuracy 0.570 on the window, 0.561 on the cue period alone, 0.571 without Fz (5,184 trials; binomial threshold 0.260) |
 
 Before these, BNCI2014001 was also used for the recipes, the speed options and
 the convergence options (README), and SpeechBrain-MOABB tuned their defaults
@@ -180,11 +251,19 @@ on it.
 
 ## To implement
 
-- The metadata table and the window rule (`tmin`, `tmax` from the cue timings).
-- All EEG channels, without the adjacency selection.
-- Step 2's all-off first trial and the transform count as complexity.
-- The one-session outer split and the contiguous-block inner folds.
-- The audit, as a script that writes its report next to the search results.
+Done (49331e0, dd80594):
+
+- The metadata table and the window rule (`tmin`, `tmax` from the cue timings):
+  the `paradigm` block, `protocol.window: paradigm`.
+- All EEG channels, without the adjacency selection: `protocol.channels: all`.
+- Step 2's all-off first trial and the transform count as complexity: per
+  step, `first_trial: all_off` and `size: n_transforms`.
+- The one-session outer split and the contiguous-block inner folds:
+  `protocol.outer_folds: rule`, `protocol.inner_folds: rule`.
+- The audit, as a script that writes its report next to the search results:
+  `sb_audit.py`.
+
+Left: the paradigm tables of the held-out datasets, and the comparison above.
 
 ## References
 

@@ -436,6 +436,63 @@ kernels). Preprocessing a new band and window takes 13 s. Estimated per test
 session's search on an H100 2g.20gb slice: about 9-10 h (step 0 1.2 h, step 1
 about 5.5 h, step 2 2-3 h, final 0.3 h; the sbatch file has the reasoning).
 
+### Version 2 of the protocol
+
+[`recipes/moabb/PROTOCOL.md`](recipes/moabb/PROTOCOL.md) is version 2: the
+protocol, the rules for changing it, and the log of what was run on
+BNCI2014001. It fixes preprocessing by rule instead of searching it (step 0 is
+gone), and applies unchanged to a new dataset from that dataset's metadata.
+`hparams/sb_moabb/v2/bnci2014001_eegnet.yaml` turns it on; every option is off
+by default, so the files above run as before.
+
+- **Preprocessing by rule**: 4-40 Hz, 125 Hz (or the recording's rate, if
+  lower), every EEG channel (`protocol.channels: all`), and the window from
+  the cue's offset to the end of imagery, read from the hparams file's
+  `paradigm` block (`protocol.window: paradigm`; 1.25-4.0 s after the cue on
+  BNCI2014001). The block's counts and rate are checked against MOABB's
+  metadata, and the search stops if they differ.
+- **Splits by rule**: a subject with one session gets two pseudo-sessions
+  (`protocol.outer_folds: rule`); one validation fold per run of the
+  training data, at most 6, or 5 blocks in time with fewer than 3 runs
+  (`protocol.inner_folds: rule`).
+- **Step 2** starts with no augmentation (`first_trial: all_off`), and the
+  one-standard-error rule counts the transforms on (`size: n_transforms`), so
+  augmentation is kept only if it's better by more than one standard error.
+- **The confound audit** (`sb_audit.py`), before the search: EEGNet-8,2 on
+  the protocol's window, on the cue period alone, and on the window without
+  the frontal channels, against the binomial chance threshold. Reported, never
+  used for selection.
+
+    python sb_audit.py hparams/sb_moabb/v2/bnci2014001_eegnet.yaml --out results/sb/v2-audit
+    python sb_search.py hparams/sb_moabb/v2/bnci2014001_eegnet.yaml --optimizer schedule-free --out results/sb/v2
+
+`cluster/drac/sb_v2.sbatch` runs the audit in task 0, then each test
+session's search as its own array task.
+
+**Cost.** On the RTX 4080 SUPER, all 9 subjects, schedule-free to 1000 epochs
+with an evaluation every 25 (step 2 and the audit evaluate at the last epoch
+only); one test session's search, as each task of the sbatch file runs it:
+
+| trial | model | cells | packs | training | peak memory |
+|---|---|---|---|---|---|
+| version 1, improved, not nested (the table above) | EEGNet-8,2 | 108 | 3 | 139 s, and 13 s preprocessing | 5.6 GiB |
+| version 2, step 1 | EEGNet-8,2 (2.1k parameters) | 54 | 2 | 60 s | 5.1 GiB |
+| version 2, step 1 | middle of step 1's priors (14.7k) | 54 | 2 | 170 s | 8.7 GiB |
+| version 2, step 2, all 7 transforms | EEGNet-8,2 | 54 | 2 | 178 s | 1.9 GiB |
+| version 2, step 2, all 7 transforms | middle of the priors | 54 | 2 | 283 s | 4.7 GiB |
+| the audit, 3 conditions | EEGNet-8,2 | 108 each | 3 each | 229 s (270 s with loading) | 5.1 GiB |
+
+The trials are 343 samples (2.75 s) of 22 channels. The band is fixed, so
+preprocessing runs once (13 s) instead of in every trial. The middle of the
+priors is 34 temporal filters of 0.35 s, depth multiplier 2, F2 = 69, a
+0.43 s separable kernel, pooling of 0.14 s, batches of 32. With every
+transform off, step 2 costs as step 1; augmentation makes it about 3x
+slower for EEGNet-8,2 and 1.7x for the larger model. Estimated per test
+session's search: about 5.9 h here (step 1 2.4 h, step 2 3.2 h, the final
+evaluation 0.2 h) and about 15 h on an H100 2g.20gb slice, from version 1's
+step 0 there (job 65435553), which took about 2.6x this GPU's time; the
+sbatch file has the reasoning.
+
 ### Results
 
 On an RTX 4080 SUPER, packed and with `--baseline`, seeds 0, 1 and 2 (seed 0

@@ -80,6 +80,8 @@ they generate hypotheses and catch bugs, but they don't test the protocol.
   `inner_folds: runs` needs at least two runs in the training session(s)
   (otherwise use `inner_folds: 5` with `group_by_run: false`, as the template
   says). Channel selection by adjacency steps from Cz needs a montage with Cz.
+  Version 2 (`PROTOCOL.md`) has rules for all three: `protocol.outer_folds:
+  rule`, `protocol.inner_folds: rule` and `protocol.channels: all`.
 - Choosing the multi-fidelity or allocation algorithm (ideas 5 and 10) is part
   of this design, and follows the same rule: the candidates are compared on
   BNCI2014001 only, for the quality of the configuration they select against
