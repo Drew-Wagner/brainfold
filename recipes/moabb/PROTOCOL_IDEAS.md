@@ -164,6 +164,17 @@ significant; not implemented), Mixup (not in their comparison; available).
 Dropped, by the rule above: testing whether augmentation helps at all on
 BNCI2014001 as a decision criterion.
 
+To do: keep "no augmentation" as a candidate in the augmentation step.
+SpeechBrain-MOABB takes step 2's best even when it is worse than step 1's
+best, which trained without augmentation. Our schedule-free run did exactly
+that (job 65405367, task 1): step 1's best scored 0.801 on validation, step
+2's best only 0.775, and the final, trained with step 2's augmentation, scored
+0.767 on validation and 0.707 ± 0.003 on test, against Adam's 0.729. Each
+transform can be off in the improved space, but all off at once is one corner
+that TPE may never sample. Fix: enqueue an all-off trial first, or compare
+step 2's best with the previous step's best by the selection rule and keep
+the better one.
+
 ### 3. Cross-validation within the training data
 
 Implemented: `protocol.inner_folds` k folds over each outer fold's training
