@@ -319,55 +319,65 @@ def eeg_augment(x, seeds, step, sample_rate, time_reverse_p=0.0, sign_flip_p=0.0
     magnitudes. Every draw is member k's own (``member_uniform`` with ``seeds[k]`` and
     the optimizer step), so a member is augmented exactly as it would be alone.
 
-    - TimeReverse, SignFlip.
-    - FTSurrogate(phase_noise_magnitude=ft_surrogate_phase, channel_indep=False).
+    - TimeReverse.
+    - FTSurrogate(phase_noise_magnitude=ft_surrogate_phase, channel_indep=False) and
+      BandstopFilter(bandwidth=bandstop_hz), one multiplication of the spectrum: the
+      band's centre is U(1 + bw/2, fs/2 - 1 - bw/2) Hz as braindecode's, but its FFT bins
+      are zeroed instead of MNE's FIR notch filter (which runs on the CPU, one example
+      at a time).
     - FrequencyShift(max_delta_freq=frequency_shift_hz): one shift per example, of
       U(-max, max) Hz, via the analytic signal, as braindecode.
-    - BandstopFilter(bandwidth=bandstop_hz): centre U(1 + bw/2, fs/2 - 1 - bw/2) Hz as
-      braindecode, but the band's FFT bins are zeroed instead of MNE's FIR notch filter
-      (which runs on the CPU, one example at a time).
-    - SmoothTimeMask(mask_len_samples=round(time_mask_s * sample_rate)).
-    - ChannelsDropout(p_drop=channels_dropout_drop).
+    - SignFlip, SmoothTimeMask(mask_len_samples=round(time_mask_s * sample_rate)) and
+      ChannelsDropout(p_drop=channels_dropout_drop), one multiplication by their masks.
+
+    The transforms are linear, so this order only matters through the draws.
     """
     B, K, C, T = x.shape
     device = x.device
     stream = iter(range(_APPLY, _APPLY + 100))
 
-    def where(p, transformed):  # each example and member: transformed with probability p
-        apply = member_uniform(seeds, step, next(stream), (B, 1, 1), device) < p
-        return torch.where(apply, transformed.to(x.dtype), x)
+    def applied(p):  # (B, K, 1, 1): whether each example and member gets a transform
+        return member_uniform(seeds, step, next(stream), (B, 1, 1), device) < p
 
     if time_reverse_p > 0:
-        x = where(time_reverse_p, x.flip(-1))
-    if sign_flip_p > 0:
-        x = where(sign_flip_p, -x)
+        x = torch.where(applied(time_reverse_p), x.flip(-1), x)
+    spectrum = None  # FTSurrogate's and BandstopFilter's factors, (B, K, 1, T // 2 + 1)
     if ft_surrogate_p > 0:
         n_random = (T - 1) // 2  # positive frequencies but the Nyquist one; it and the mean keep their phase
         phase = member_uniform(seeds, step, _FT, (B, 1, n_random), device)
-        f = torch.fft.rfft(x, dim=-1)
-        rotation = torch.exp(2j * math.pi * ft_surrogate_phase * phase).to(f.dtype)
-        f = torch.cat([f[..., :1], f[..., 1 : n_random + 1] * rotation, f[..., n_random + 1 :]], -1)
-        x = where(ft_surrogate_p, torch.fft.irfft(f, n=T, dim=-1))
-    if frequency_shift_p > 0:
-        delta = (2 * member_uniform(seeds, step, _SHIFT, (B,), device) - 1) * frequency_shift_hz
-        x = where(frequency_shift_p, _frequency_shift(x, sample_rate, delta.to(x.dtype)))
+        rotation = torch.where(applied(ft_surrogate_p), torch.exp(2j * math.pi * ft_surrogate_phase * phase), 1)
+        ones = torch.ones(B, K, 1, 1, dtype=rotation.dtype, device=device)
+        spectrum = torch.cat([ones, rotation, ones.expand(B, K, 1, T // 2 + 1 - n_random - 1)], -1)
     if bandstop_p > 0 and bandstop_hz > 0:
         u = member_uniform(seeds, step, _BANDSTOP, (B, 1, 1), device)
         centre = 1 + bandstop_hz / 2 + u * (sample_rate / 2 - 2 - bandstop_hz)
         freqs = torch.fft.rfftfreq(T, 1 / sample_rate, device=device, dtype=torch.float64)
-        keep = (freqs - centre).abs() > bandstop_hz / 2
-        x = where(bandstop_p, torch.fft.irfft(torch.fft.rfft(x, dim=-1) * keep, n=T, dim=-1))
+        keep = torch.where(applied(bandstop_p), ((freqs - centre).abs() > bandstop_hz / 2).double(), 1.0)
+        spectrum = keep if spectrum is None else spectrum * keep
+    if spectrum is not None:
+        f = torch.fft.rfft(x, dim=-1)
+        x = torch.fft.irfft(f * spectrum.to(f.dtype), n=T, dim=-1)
+    if frequency_shift_p > 0:
+        delta = (2 * member_uniform(seeds, step, _SHIFT, (B,), device) - 1) * frequency_shift_hz
+        x = torch.where(applied(frequency_shift_p), _frequency_shift(x, sample_rate, delta.to(x.dtype)), x)
+    mask = None  # SignFlip's, SmoothTimeMask's and ChannelsDropout's, multiplied
+    if sign_flip_p > 0:
+        mask = torch.where(applied(sign_flip_p), -1.0, 1.0)
     if time_mask_p > 0:
         length = round(time_mask_s * sample_rate)
         start = member_uniform(seeds, step, _MASK, (B, 1, 1), device) * (T - length)
         t = torch.arange(T, device=device, dtype=torch.float64)
         s = 1000 / T
-        mask = torch.sigmoid(s * -(t - start)) + torch.sigmoid(s * (t - start - length))
-        x = where(time_mask_p, x * mask.to(x.dtype))
+        smooth = torch.sigmoid(s * -(t - start)) + torch.sigmoid(s * (t - start - length))
+        smooth = torch.where(applied(time_mask_p), smooth, 1.0)
+        mask = smooth if mask is None else mask * smooth
     if channels_dropout_p > 0:
         u = member_uniform(seeds, step, _DROPOUT, (B, C), device)
-        mask = torch.sigmoid(1000 * (u - channels_dropout_drop))  # braindecode's soft 0/1 mask
-        x = where(channels_dropout_p, x * mask[..., None].to(x.dtype))
+        dropped = torch.sigmoid(1000 * (u - channels_dropout_drop))[..., None]  # braindecode's soft 0/1 mask
+        dropped = torch.where(applied(channels_dropout_p), dropped, 1.0)
+        mask = dropped if mask is None else mask * dropped
+    if mask is not None:
+        x = x * mask.to(x.dtype)
     return x
 
 

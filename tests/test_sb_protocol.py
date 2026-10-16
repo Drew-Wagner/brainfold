@@ -270,7 +270,7 @@ def test_eeg_augment_pack_equals_members():
     for k, seed in enumerate(seeds):
         alone = protocol.eeg_augment(x[:, k : k + 1], [seed], 7, 50.0, **EEG_AUG)
         torch.testing.assert_close(packed[:, k : k + 1], alone)
-    changed = (packed != x).flatten(2).any(-1)  # (B, K): some transform applied
+    changed = (packed - x).abs().flatten(2).amax(-1) > 1e-9  # (B, K): some transform applied
     assert changed.any() and not changed.all()
 
 
