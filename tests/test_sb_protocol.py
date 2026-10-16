@@ -220,3 +220,197 @@ def test_pack_equals_members(optimizer, avg_models):
         for epoch in (2, 4):  # the evaluations train_idx[:1] of the pack-of-one see member 0's trials
             if k == 0:
                 torch.testing.assert_close(seen["packed"][epoch][:, :1], seen[k][epoch])
+
+
+# ---- the improved protocol's pieces (PROTOCOL_IDEAS.md) ---------------------------------------------
+
+def test_hash_matches_python():
+    def lowbias32(x):
+        x &= 0xFFFFFFFF
+        x ^= x >> 16
+        x = (x * 0x7FEB352D) & 0xFFFFFFFF
+        x ^= x >> 15
+        x = (x * 0x846CA68B) & 0xFFFFFFFF
+        return x ^ (x >> 16)
+
+    values = torch.randint(0, 2**32, (2000,), dtype=torch.int64, generator=torch.Generator().manual_seed(0))
+    assert protocol._hash32(values).tolist() == [lowbias32(v) for v in values.tolist()]
+
+
+def test_member_draws_dont_depend_on_the_pack():
+    seeds = [5, 9, 5, 1986]
+    packed = protocol.member_uniform(seeds, 17, 3, (8, 4), "cpu")
+    assert packed.shape == (8, 4, 4)
+    for k, seed in enumerate(seeds):
+        torch.testing.assert_close(packed[:, k], protocol.member_uniform([seed], 17, 3, (8, 4), "cpu")[:, 0])
+    assert not torch.equal(packed[:, 0], packed[:, 1])  # other seeds, other draws
+    assert not torch.equal(packed, protocol.member_uniform(seeds, 18, 3, (8, 4), "cpu"))  # and every step
+    u = protocol.member_uniform(list(range(50)), 0, 0, (2000,), "cpu")
+    assert 0 <= u.min() and u.max() < 1 and abs(u.mean() - 0.5) < 0.01 and abs(u.var() - 1 / 12) < 0.002
+
+
+def test_beta_draws():
+    alpha = 0.4
+    g1 = protocol._member_gamma(list(range(20)), 3, 0, (5000,), alpha, "cpu")
+    g2 = protocol._member_gamma(list(range(20)), 3, 500, (5000,), alpha, "cpu")
+    lam = g1 / (g1 + g2)
+    assert abs(g1.mean() - alpha) < 0.02  # Gamma(a, 1) has mean a
+    assert abs(lam.mean() - 0.5) < 0.01 and abs(lam.var() - 1 / (4 * (2 * alpha + 1))) < 0.005
+
+
+EEG_AUG = dict(time_reverse_p=0.5, sign_flip_p=0.5, ft_surrogate_p=0.5, ft_surrogate_phase=0.9, frequency_shift_p=0.5,
+               frequency_shift_hz=2.7, bandstop_p=0.5, bandstop_hz=1.0, time_mask_p=0.5, time_mask_s=0.3,
+               channels_dropout_p=0.5, channels_dropout_drop=0.4)
+
+
+def test_eeg_augment_pack_equals_members():
+    x = torch.randn(12, 4, 3, 101, dtype=torch.float64)
+    seeds = [3, 4, 3, 8]
+    packed = protocol.eeg_augment(x, seeds, 7, 50.0, **EEG_AUG)
+    for k, seed in enumerate(seeds):
+        alone = protocol.eeg_augment(x[:, k : k + 1], [seed], 7, 50.0, **EEG_AUG)
+        torch.testing.assert_close(packed[:, k : k + 1], alone)
+    changed = (packed != x).flatten(2).any(-1)  # (B, K): some transform applied
+    assert changed.any() and not changed.all()
+
+
+class _Draws(np.random.RandomState):
+    """A RandomState whose uniform() returns given draws, to give braindecode ours."""
+
+    def __init__(self, draws):
+        super().__init__(0)
+        self.draws = draws
+
+    def uniform(self, low=0.0, high=1.0, size=None):
+        return low + (high - low) * self.draws
+
+
+@pytest.mark.parametrize("transform", ["time_reverse", "sign_flip", "ft_surrogate", "frequency_shift", "time_mask",
+                                       "channels_dropout"])
+def test_eeg_transforms_match_braindecode(transform, monkeypatch):
+    """Each transform alone, applied to every example (p = 1), against braindecode's functional with our draws."""
+    from braindecode.augmentation import functional as bf
+
+    B, K, C, T, fs, step = 6, 3, 4, 100, 50.0, 11
+    x = torch.randn(B, K, C, T)
+    seeds = [1, 2, 3]
+    y = torch.zeros(B)
+    out = protocol.eeg_augment(x, seeds, step, fs, **{f"{transform}_p": 1.0}, ft_surrogate_phase=0.7,
+                               frequency_shift_hz=2.5, time_mask_s=0.4, channels_dropout_drop=0.3)
+    for k in range(K):
+        if transform == "time_reverse":
+            ref = bf.time_reverse(x[:, k], y)[0]
+        elif transform == "sign_flip":
+            ref = bf.sign_flip(x[:, k], y)[0]
+        elif transform == "ft_surrogate":
+            u = protocol.member_uniform(seeds, step, protocol._FT, (B, 1, (T - 1) // 2), "cpu")[:, k]
+            phase = 2j * np.pi * u.numpy()
+            full = lambda b, c, n, device, random_state: torch.from_numpy(np.concatenate(
+                [np.zeros((b, c, 1)), phase, np.zeros((b, c, 1)), -phase[..., ::-1]], -1))  # T even
+            monkeypatch.setitem(bf._new_random_fft_phase, 0, full)
+            ref = bf.ft_surrogate(x[:, k], y, 0.7, channel_indep=False)[0]
+        elif transform == "frequency_shift":
+            u = protocol.member_uniform(seeds, step, protocol._SHIFT, (B,), "cpu")[:, k]
+            ref = bf.frequency_shift(x[:, k], y, (2 * u - 1).float() * 2.5, fs)[0]
+        elif transform == "time_mask":
+            u = protocol.member_uniform(seeds, step, protocol._MASK, (B, 1, 1), "cpu")[:, k, 0, 0]
+            length = round(0.4 * fs)
+            ref = bf.smooth_time_mask(x[:, k], y, u * (T - length), length)[0]
+        else:
+            u = protocol.member_uniform(seeds, step, protocol._DROPOUT, (B, C), "cpu")[:, k]
+            ref = bf.channels_dropout(x[:, k], y, 0.3, random_state=_Draws(u.numpy()))[0]
+        torch.testing.assert_close(out[:, k], ref.float(), atol=2e-5, rtol=1e-4)
+
+
+def test_bandstop_removes_the_band_only():
+    B, K, C, T, fs = 5, 2, 3, 200, 100.0
+    x = torch.randn(B, K, C, T, dtype=torch.float64)
+    out = protocol.eeg_augment(x, [4, 5], 2, fs, bandstop_p=1.0, bandstop_hz=2.0)
+    centre = 1 + 1.0 + protocol.member_uniform([4, 5], 2, protocol._BANDSTOP, (B, 1, 1), "cpu") * (fs / 2 - 2 - 2.0)
+    freqs = torch.fft.rfftfreq(T, 1 / fs, dtype=torch.float64)
+    band = ((freqs - centre).abs() <= 1.0).expand(B, K, C, -1)
+    f_in, f_out = torch.fft.rfft(x), torch.fft.rfft(out)
+    assert band.sum(-1).min() >= 3  # 2 Hz at 0.5 Hz resolution
+    assert f_out.abs()[band].max() < 1e-9
+    torch.testing.assert_close(f_out[~band], f_in[~band])
+
+
+def test_mixup_matches_braindecode():
+    from braindecode.augmentation import functional as bf
+
+    B, K = 8, 3
+    x = torch.randn(B, K, 2, 30)
+    perm, lam = protocol.mixup_draws([1, 2, 3], 4, B, K, 0.5, 0.4, "cpu")
+    assert (lam == 1).any() and (lam < 1).any()
+    for k in range(K):
+        assert sorted(perm[:, k].tolist()) == list(range(B))
+        mixed = lam[:, k, None, None].float() * x[:, k] + (1 - lam[:, k, None, None].float()) * x[perm[:, k], k]
+        torch.testing.assert_close(mixed, bf.mixup(x[:, k], torch.zeros(B), lam[:, k].float(), perm[:, k])[0])
+
+
+@pytest.mark.parametrize("mixup_p", [0.0, 0.5])
+def test_pack_equals_members_with_eeg_augmentation(mixup_p):
+    g = torch.Generator().manual_seed(0)
+    X = torch.randn(60, 6, 120, generator=g, dtype=torch.float64) * 5 + 1
+    Xn = protocol.standardize(X)
+    y = torch.randint(3, (60,), generator=g)
+    train_idx = torch.stack([torch.arange(0, 30), torch.randperm(60, generator=g)[:30], torch.arange(30, 60)])
+    seeds = [3, 4, 3]
+    hp = dict(cnn_temporal_kernels=4, cnn_spatial_depth_multiplier=2, cnn_septemporal_point_kernels_ratio_=4,
+              cnn_temporal_kernelsize=25, cnn_septemporal_kernelsize_=5, cnn_septemporal_pool=4, dropout=0.0,
+              bn_momentum=0.1)
+    kwargs = protocol.eegnet_kwargs(hp, 6, 3, 120)
+    settings = dict(number_of_epochs=3, lr=5e-3, batch_size=8, avg_models=1)
+    eeg_aug = dict(EEG_AUG, mixup_p=mixup_p, mixup_alpha=0.4)
+    packed = protocol.build(kwargs, seeds, "cpu").double()
+    packed, losses = protocol.fit(packed, X, Xn, y, train_idx, seeds, settings, "schedule-free", eeg_aug=eeg_aug,
+                                  sample_rate=40.0)
+    for k, seed in enumerate(seeds):
+        alone = protocol.build(kwargs, [seed], "cpu").double()
+        alone, alone_losses = protocol.fit(alone, X, Xn, y, train_idx[k : k + 1], [seed], settings, "schedule-free",
+                                           eeg_aug=eeg_aug, sample_rate=40.0)
+        torch.testing.assert_close(losses[:, k : k + 1], alone_losses)
+        for key, value in alone.member_state_dict(0).items():
+            if not key.endswith("num_batches_tracked"):
+                torch.testing.assert_close(packed.member_state_dict(k)[key], value, msg=key)
+
+
+def test_inner_folds():
+    rng = np.random.default_rng(0)
+    sessions = np.repeat(["0train", "1test"], 48)
+    runs = np.tile(np.repeat(["0", "1", "2", "3", "4", "5"], 8), 2)
+    y = rng.integers(0, 4, 96)
+    pool = np.flatnonzero(sessions == "0train")
+    for by_run, k in ((False, 5), (True, 3), (True, 4), (True, 6)):
+        folds = protocol.inner_folds(pool, y, sessions, runs, k, by_run)
+        assert len(folds) == k
+        assert sorted(np.concatenate([v for _, v in folds]).tolist()) == pool.tolist()  # each validated once
+        for train, valid in folds:
+            assert sorted(np.concatenate([train, valid]).tolist()) == pool.tolist()
+            if by_run:  # whole runs, consecutive
+                in_valid = sorted(set(runs[valid].tolist()))
+                assert set(runs[train].tolist()).isdisjoint(in_valid)
+                assert [int(r) for r in in_valid] == list(range(int(in_valid[0]), int(in_valid[-1]) + 1))
+            else:  # every k-th trial of each class
+                for c in range(4):
+                    of_class = pool[y[pool] == c]
+                    assert abs(np.isin(of_class, valid).sum() - len(of_class) / k) < 1
+    with pytest.raises(ValueError):
+        protocol.inner_folds(pool, y, sessions, runs, 7, True)
+
+
+def test_kernels_in_seconds_and_model_size():
+    from braindecode.models import EEGNet
+
+    hp = dict(cnn_temporal_kernels=8, cnn_spatial_depth_multiplier=2, cnn_septemporal_point_kernels_ratio_=4,
+              dropout=0.5, cnn_temporal_kernel_s=0.5, cnn_septemporal_kernel_s=0.5, cnn_septemporal_pool_s=0.25)
+    for rate in (128, 250):
+        kwargs = protocol.eegnet_kwargs(hp, 22, 4, 4 * rate, rate)
+        assert kwargs["kernel_length"] == round(rate / 2)
+        assert kwargs["depthwise_kernel_length"] == round(rate / 4 / 2)
+        assert kwargs["pool2_kernel_size"] == round(rate / 4 / 4)
+        params, flops = protocol.model_size(kwargs)
+        assert params == sum(p.numel() for p in EEGNet(**kwargs).parameters()) and flops > 0
+    state = torch.random.get_rng_state()
+    protocol.model_size(kwargs)
+    assert torch.equal(state, torch.random.get_rng_state())  # doesn't touch the global RNG
