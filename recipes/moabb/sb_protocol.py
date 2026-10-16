@@ -168,14 +168,16 @@ def inner_folds(pool, y, sessions, runs, k, by_run):
 
     ``by_run``: each validation set is whole runs, consecutive in recording order
     ((session, run) groups split as evenly as np.array_split does), so validation is
-    temporally separate from training, as a test session is. Otherwise, the k-fold
-    version of SpeechBrain-MOABB's split: every k-th trial of each class, in time order.
+    temporally separate from training, as a test session is; k "runs" is one fold per
+    run. Otherwise, the k-fold version of SpeechBrain-MOABB's split: every k-th trial of
+    each class, in time order.
     """
     pool = np.sort(pool)
     fold_of = np.empty(len(pool), dtype=int)
     if by_run:
         group = [(sessions[i], runs[i]) for i in pool]
         names = list(dict.fromkeys(group))
+        k = len(names) if k == "runs" else k
         if len(names) < k:
             raise ValueError(f"{k} validation folds of whole runs, but the training data have {len(names)} runs")
         chunk = {name: j for j, chunk in enumerate(np.array_split(np.arange(len(names)), k)) for name in
@@ -185,7 +187,7 @@ def inner_folds(pool, y, sessions, runs, k, by_run):
         for c in np.unique(y[pool]):
             of_class = np.flatnonzero(y[pool] == c)
             fold_of[of_class] = np.arange(len(of_class)) % k
-    return [(pool[fold_of != j], pool[fold_of == j]) for j in range(k)]
+    return [(pool[fold_of != j], pool[fold_of == j]) for j in range(fold_of.max() + 1)]
 
 
 def standardize(x, eps=1e-6):
@@ -342,8 +344,8 @@ def eeg_augment(x, seeds, step, sample_rate, time_reverse_p=0.0, sign_flip_p=0.0
     if ft_surrogate_p > 0:
         n_random = (T - 1) // 2  # positive frequencies but the Nyquist one; it and the mean keep their phase
         phase = member_uniform(seeds, step, _FT, (B, 1, n_random), device)
-        f = torch.fft.rfft(x.double(), dim=-1)
-        rotation = torch.exp(2j * math.pi * ft_surrogate_phase * phase)
+        f = torch.fft.rfft(x, dim=-1)
+        rotation = torch.exp(2j * math.pi * ft_surrogate_phase * phase).to(f.dtype)
         f = torch.cat([f[..., :1], f[..., 1 : n_random + 1] * rotation, f[..., n_random + 1 :]], -1)
         x = where(ft_surrogate_p, torch.fft.irfft(f, n=T, dim=-1))
     if frequency_shift_p > 0:
@@ -354,7 +356,7 @@ def eeg_augment(x, seeds, step, sample_rate, time_reverse_p=0.0, sign_flip_p=0.0
         centre = 1 + bandstop_hz / 2 + u * (sample_rate / 2 - 2 - bandstop_hz)
         freqs = torch.fft.rfftfreq(T, 1 / sample_rate, device=device, dtype=torch.float64)
         keep = (freqs - centre).abs() > bandstop_hz / 2
-        x = where(bandstop_p, torch.fft.irfft(torch.fft.rfft(x.double(), dim=-1) * keep, n=T, dim=-1))
+        x = where(bandstop_p, torch.fft.irfft(torch.fft.rfft(x, dim=-1) * keep, n=T, dim=-1))
     if time_mask_p > 0:
         length = round(time_mask_s * sample_rate)
         start = member_uniform(seeds, step, _MASK, (B, 1, 1), device) * (T - length)

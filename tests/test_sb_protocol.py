@@ -381,9 +381,9 @@ def test_inner_folds():
     runs = np.tile(np.repeat(["0", "1", "2", "3", "4", "5"], 8), 2)
     y = rng.integers(0, 4, 96)
     pool = np.flatnonzero(sessions == "0train")
-    for by_run, k in ((False, 5), (True, 3), (True, 4), (True, 6)):
+    for by_run, k in ((False, 5), (True, 3), (True, 4), (True, 6), (True, "runs")):
         folds = protocol.inner_folds(pool, y, sessions, runs, k, by_run)
-        assert len(folds) == k
+        assert len(folds) == (6 if k == "runs" else k)
         assert sorted(np.concatenate([v for _, v in folds]).tolist()) == pool.tolist()  # each validated once
         for train, valid in folds:
             assert sorted(np.concatenate([train, valid]).tolist()) == pool.tolist()

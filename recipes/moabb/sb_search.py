@@ -29,7 +29,9 @@ as before; the hparams files under hparams/sb_moabb/improved/ turn them on):
 
 - `steps` instead of `search`: the steps in order, each with its priors, its
   `augment` (none, speechbrain or eeg), its own `fixed` values and optionally its
-  own `trials`, so preprocessing can be a step of its own.
+  own `trials` and `selection`, so preprocessing can be a step of its own. With schedule-free, a
+  step trains to the epoch an earlier step chose, or with `epochs: grid` chooses
+  it again.
 - `protocol`: `inner_folds` validation folds within the training sessions
   (`group_by_run`: of whole runs), `seeds_per_trial` seeds (`trial_seeds:
   per_trial` for seeds that differ between trials), `selection: one_se` (the
@@ -116,10 +118,11 @@ def steps_of(cfg):
 
 
 PROTOCOL = dict(  # SpeechBrain-MOABB's
-    inner_folds=0,  # 0: one validation set, `valid_ratio` of each class, equally spaced in time
+    inner_folds=0,  # 0: one validation set, `valid_ratio` of each class, equally spaced in time; "runs": one per run
     group_by_run=False,
     seeds_per_trial=1,
     trial_seeds="fixed",  # every trial uses seeds seed, seed + 1, ...; or "per_trial"
+    seed_per_inner_fold=False,  # True: each inner fold trains from its own seed, derived from the trial's
     selection="best",  # or "one_se"
     size="params",  # or "flops": the size one_se and multi_objective minimize
     multi_objective=False,
@@ -142,8 +145,9 @@ def prepare(hp, recordings, cfg, args):
     sample_rate = hp.get("sample_rate", cfg["sample_rate"])
     X, y, subjects, sessions = recordings.trials(hp["fmin"], hp["fmax"], sample_rate)
     runs = recordings.runs(hp["fmin"], hp["fmax"], sample_rate)
-    tmax = hp["tmin"] + hp["twindow"] if "twindow" in hp else hp["tmax"]
-    X = protocol.crop(X, sample_rate, recordings.interval(), hp["tmin"], tmax)
+    interval = recordings.interval()
+    tmax = min(hp["tmin"] + hp["twindow"], interval[1]) if "twindow" in hp else hp["tmax"]
+    X = protocol.crop(X, sample_rate, interval, hp["tmin"], tmax)
     X = X[:, recordings.channels(hp["n_steps_channel_selection"])]
     folds = protocol.leave_one_session_out(y, subjects, sessions, cfg["valid_ratio"])
     X = torch.from_numpy(X).to(args.device)
@@ -155,7 +159,9 @@ def make_cells(data, seeds, settings, final=False):
     """Every cell of a trial, (outer fold, inner fold, seed), in the order they're packed.
 
     With ``inner_folds`` 0, the cells are SpeechBrain-MOABB's (fold, seed) runs; with k,
-    each outer fold's training trials (theirs and their validation set's) are split k ways.
+    each outer fold's training trials (theirs and their validation set's) are split k ways,
+    and with ``seed_per_inner_fold`` each inner fold gets its own seed (so k folds and one
+    seed per trial average over k seeds, at no extra cost).
     In the final evaluation with ``final_train: all``, a cell trains on all of them and has
     no validation set.
     """
@@ -170,7 +176,10 @@ def make_cells(data, seeds, settings, final=False):
             else:
                 splits = [(train, valid)]
             for j, (tr, va) in enumerate(splits):
-                cells.append(dict(fold=name, inner=j, seed=seed, train=torch.from_numpy(tr),
+                cell_seed = seed
+                if settings.get("seed_per_inner_fold") and j > 0:  # inner fold j's own seed, from (seed, j)
+                    cell_seed = int(np.random.SeedSequence([seed, j]).generate_state(1)[0] % 2**31)
+                cells.append(dict(fold=name, inner=j, seed=cell_seed, train=torch.from_numpy(tr),
                                   valid=None if va is None else torch.from_numpy(va), test=torch.from_numpy(test)))
     return cells
 
@@ -207,14 +216,21 @@ def train_cells(cells, hp, data, cfg, args, label, eval_epochs):
 
     Returns curve rows (one per cell and evaluated epoch), rows (one per cell), the
     cells' training losses (epochs, n_cells) and timings. A pack that runs out of
-    memory is split in two.
+    memory is split in two, and the packs after it are no larger than its halves
+    (``oom_seconds`` is the time lost).
     """
     device, X, Xn, y = args.device, data["X"], data["Xn"], data["y"]
     aug, eeg_aug = augmentation(hp, hp.get("augment", "none"), data["sample_rate"])
     kwargs = protocol.eegnet_kwargs(hp, X.shape[1], cfg["n_classes"], X.shape[2], data["sample_rate"])
-    rows, curves, losses, timing = [], [], [], dict(train_seconds=0.0, peak_allocated=0, n_packs=0)
+    rows, curves, losses, timing = [], [], [], dict(train_seconds=0.0, oom_seconds=0.0, peak_allocated=0, n_packs=0)
+
+    limit = [len(cells)]  # the largest pack that fitted in memory so far
 
     def train_pack(pack):
+        if len(pack) > limit[0]:
+            for start in range(0, len(pack), limit[0]):
+                train_pack(pack[start : start + limit[0]])
+            return
         pack_seeds = [c["seed"] for c in pack]
         train_idx, test_idx = (torch.stack([c[key] for c in pack]).to(device) for key in ("train", "test"))
         valid_idx = None if pack[0]["valid"] is None else torch.stack([c["valid"] for c in pack]).to(device)
@@ -236,10 +252,16 @@ def train_cells(cells, hp, data, cfg, args, label, eval_epochs):
         except torch.OutOfMemoryError:
             if len(pack) == 1:
                 raise
+            out_of_memory = True
+        else:
+            out_of_memory = False
+        if out_of_memory:  # outside the except block, whose traceback holds the failed pack's tensors
             model = None
+            timing["oom_seconds"] += time.perf_counter() - t
+            limit[0] = (len(pack) + 1) // 2  # and the packs after this one start at that size
             print(f"  out of memory with {len(pack)} runs per pack; splitting it", flush=True)
-            train_pack(pack[: len(pack) // 2])
-            train_pack(pack[len(pack) // 2 :])
+            train_pack(pack[: limit[0]])
+            train_pack(pack[limit[0] :])
             return
         timing["train_seconds"] += time.perf_counter() - t
         timing["peak_allocated"] = max(timing["peak_allocated"], peak_memory(device)[0] or 0)
@@ -440,6 +462,8 @@ def context_before(cfg, steps, step, out, optimizer):
     hp = dict(cfg["fixed"])
     for name, settings in steps.items():
         if name == step:
+            if settings.get("epochs") == "grid":
+                hp.pop("chosen_epochs", None)
             return dict(hp, **settings["fixed"], augment=settings["augment"])
         best = yaml.safe_load((out / f"best-{name}.yaml").read_text())
         hp.update(best["values"])
@@ -550,6 +574,8 @@ def main():
             trial = study.ask()
             values = suggest(trial, step_settings["search"])
             trial_hp = {**hp, **step_settings["fixed"], **values, "augment": step_settings["augment"]}
+            if step_settings.get("epochs") == "grid":  # schedule-free: choose the epoch again
+                trial_hp.pop("chosen_epochs", None)
             label = f"{step}/trial{trial.number:03d}"
             seeds = trial_seeds(seed_base, settings["seeds_per_trial"], trial.number,
                                 settings["trial_seeds"] == "per_trial")
@@ -590,7 +616,7 @@ def main():
                   flush=True)
             n_train = int(result["rows"][0]["n_train"])
             log.trial(step, result, values, test, best, epoch_lr(trial_hp, args.optimizer, n_train), size)
-        chosen, why = select(complete(), settings["selection"], settings["size"])
+        chosen, why = select(complete(), step_settings.get("selection", settings["selection"]), settings["size"])
         hp.update(chosen.user_attrs["values"])
         if sf:
             hp["chosen_epochs"] = chosen.user_attrs["epoch"]

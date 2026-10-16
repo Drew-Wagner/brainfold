@@ -59,6 +59,10 @@ def test_cells_with_inner_folds():
         assert sorted(c["train"].tolist() + c["valid"].tolist()) == pool.tolist()
         assert len(set(data["runs"][c["valid"].numpy()])) == 2  # two of the six runs
     assert all(len({len(c["train"]) for c in pack}) == 1 for pack in sb_search.pack_cells(cells, 10))
+    per_fold = sb_search.make_cells(data, [1, 2], dict(settings, seed_per_inner_fold=True))
+    assert [c["seed"] for c in per_fold if c["inner"] == 0] == [c["seed"] for c in cells if c["inner"] == 0]
+    seeds = {(c["seed"], c["inner"]) for c in per_fold}
+    assert len({s for s, _ in seeds}) == 6 and len(seeds) == 6  # 2 seeds x 3 inner folds, each its own
     final = sb_search.make_cells(data, [1], dict(settings, final_train="all"), final=True)
     assert len(final) == len(data["folds"]) and all(c["valid"] is None for c in final)
     assert len(final[0]["train"]) == len(np.union1d(data["folds"][0][1], data["folds"][0][2]))
@@ -93,6 +97,20 @@ def test_select():
     assert sb_search.select(trials, "one_se", "flops")[0].number == 1
     trials[0].user_attrs["se"] = float("nan")  # one seed and one validation split: no standard error
     assert sb_search.select(trials, "one_se", "params")[0].number == 0
+
+
+def test_context_before(tmp_path):
+    """A step's starting values rebuilt from best-*.yaml, for studies run before trials recorded them."""
+    cfg = dict(fixed=dict(lr=0.1, fmin=1.0, dropout=0.5),
+               steps=dict(step0=dict(search={}, epochs="grid"), step1=dict(search={}, epochs="grid"),
+                          step2=dict(search={}, augment="eeg", fixed=dict(dropout=0.0))))
+    steps = sb_search.steps_of(cfg)
+    (tmp_path / "best-step0.yaml").write_text("trial: 3\nvalid: 0.5\nepoch: 300\nvalues: {fmin: 2.0}\n")
+    (tmp_path / "best-step1.yaml").write_text("trial: 4\nvalid: 0.6\nepoch: 500\nvalues: {lr: 0.01}\n")
+    hp = sb_search.context_before(cfg, steps, "step1", tmp_path, "schedule-free")
+    assert hp == dict(lr=0.1, fmin=2.0, dropout=0.5, augment="none")  # step 1 chooses its epoch again
+    hp = sb_search.context_before(cfg, steps, "step2", tmp_path, "schedule-free")
+    assert hp == dict(lr=0.01, fmin=2.0, dropout=0.0, augment="eeg", chosen_epochs=500)
 
 
 def test_steps_of():
