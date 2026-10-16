@@ -6,7 +6,8 @@ On a new dataset the protocol runs from scratch: it searches again and
 chooses its own configuration. What has to generalize is the procedure, not
 the configuration it found on BNCI2014001.
 
-Status: draft, 2026-10-16, not implemented. Version 1 (the "improved
+Status: draft, 2026-10-16, not implemented; the spec was first committed at
+d7e4159. The log below gives the commit each variant ran. Version 1 (the "improved
 protocol", `hparams/sb_moabb/improved/bnci2014001_eegnet.yaml`) is running as
 job 65435553. `PROTOCOL_IDEAS.md` keeps the ideas and their implementation
 notes; this file is the protocol itself, the rules for changing it, and the
@@ -166,12 +167,12 @@ A draft; nothing below is run yet.
 
 ## Log of variants run on BNCI2014001
 
-| # | Variant | Job | Result | Notes |
-|---|---|---|---|---|
-| 1 | SpeechBrain-MOABB's protocol, Adam | 65405367_0 | 0.729 ± 0.007 test (10 seeds), 11.8k parameters, 3 h 02 min | Not exactly theirs: BatchNorm momentum searched (they fix 0.01) |
-| 2 | SpeechBrain-MOABB's protocol, schedule-free | 65405367_1 | 0.707 ± 0.003 test, 53.7k parameters, 6 h 01 min | Step 2 kept augmentation that lowered validation |
-| 3 | Version 1 (step 0 searched), replicate 0 | 65435553 | Running | Step 0 chose fmin 2.4-2.6 Hz, tmin 0.2 s |
-| 4 | Version 2 | Not run | | This draft |
+| # | Variant | Commit | Job | Result | Notes |
+|---|---|---|---|---|---|
+| 1 | SpeechBrain-MOABB's protocol, Adam | 1e4ea9e (tag `protocol-sb-repro`) | 65405367_0 | 0.729 ± 0.007 test (10 seeds), 11.8k parameters, 3 h 02 min | Not exactly theirs: BatchNorm momentum searched (they fix 0.01) |
+| 2 | SpeechBrain-MOABB's protocol, schedule-free | 1e4ea9e (tag `protocol-sb-repro`) | 65405367_1 | 0.707 ± 0.003 test, 53.7k parameters, 6 h 01 min | Step 2 kept augmentation that lowered validation |
+| 3 | Version 1 (step 0 searched), replicate 0 | a0c5b53 (tag `protocol-v1`) | 65435553 | Running | Step 0 chose fmin 2.4-2.6 Hz, tmin 0.2 s |
+| 4 | Version 2 | Spec d7e4159; code not yet written | Not run | | This draft |
 
 Before these, BNCI2014001 was also used for the recipes, the speed options and
 the convergence options (README), and SpeechBrain-MOABB tuned their defaults
