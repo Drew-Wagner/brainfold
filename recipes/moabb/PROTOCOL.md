@@ -10,7 +10,7 @@ Status: draft, 2026-10-16; the spec was first committed at d7e4159 and
 implemented at 49331e0 and dd80594 (`hparams/sb_moabb/v2/bnci2014001_eegnet.yaml`,
 `sb_audit.py`, `cluster/drac/sb_v2.sbatch`; the README's "Version 2 of the
 protocol" has the commands and measured costs). Not run yet. The log below gives the commit each variant ran. Version 1 (the "improved
-protocol", `hparams/sb_moabb/improved/bnci2014001_eegnet.yaml`) is running as
+protocol", `hparams/sb_moabb/improved/bnci2014001_eegnet.yaml`) ran as
 job 65435553. `PROTOCOL_IDEAS.md` keeps the ideas and their implementation
 notes; this file is the protocol itself, the rules for changing it, and the
 log of what we ran.
@@ -242,7 +242,7 @@ A draft; nothing below is run yet.
 |---|---|---|---|---|---|
 | 1 | SpeechBrain-MOABB's protocol, Adam | 1e4ea9e (tag `protocol-sb-repro`) | 65405367_0 | 0.729 ± 0.007 test (10 seeds), 11.8k parameters, 3 h 02 min | Not exactly theirs: BatchNorm momentum searched (they fix 0.01) |
 | 2 | SpeechBrain-MOABB's protocol, schedule-free | 1e4ea9e (tag `protocol-sb-repro`) | 65405367_1 | 0.707 ± 0.003 test, 53.7k parameters, 6 h 01 min | Step 2 kept augmentation that lowered validation |
-| 3 | Version 1 (step 0 searched), replicate 0 | a0c5b53 (tag `protocol-v1`) | 65435553 | Running | Step 0 chose fmin 2.4-2.6 Hz, tmin 0.2 s |
+| 3 | Version 1 (step 0 searched), replicate 0 | a0c5b53 (tag `protocol-v1`) | 65435553 | 0.769 ± 0.003 test (10 seeds, both test sessions), 33.7k and 16.1k parameters, 13 h 48 min and 15 h 39 min | Step 0 chose fmin 2.4-2.6 Hz, tmin 0.2 s, so the window includes most of the cue period. Both test sessions' step 2 chose FrequencyShift and BandstopFilter. One replicate; not a reason to change the protocol (rule 2) |
 | 4 | Version 2 | Spec d7e4159; code 49331e0, dd80594 | Not run | | This draft. The audit was run once locally (RTX 4080 SUPER, 2026-10-16), for its cost: validation accuracy 0.570 on the window, 0.561 on the cue period alone, 0.571 without Fz (5,184 trials; binomial threshold 0.260) |
 
 Before these, BNCI2014001 was also used for the recipes, the speed options and
