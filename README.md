@@ -330,7 +330,7 @@ as an Adam one.
 ### SpeechBrain-MOABB's protocol
 
 `sb_search.py` runs the decoding protocol of SpeechBrain-MOABB (Borra,
-Magosso and Ravanelli, 2024) with packed training. It reproduces their
+Paissan and Ravanelli, 2024) with packed training. It reproduces their
 preprocessing, their leave-one-session-out splits with class-balanced
 validation sets, their training (Xavier init, Adam with a triangular cyclic
 learning rate, class-weighted loss, four augmentations, averaging of the last

@@ -1,4 +1,4 @@
-"""SpeechBrain-MOABB's decoding protocol (Borra, Magosso and Ravanelli, 2024), with packed training.
+"""SpeechBrain-MOABB's decoding protocol (Borra, Paissan and Ravanelli, 2024), with packed training.
 
 Reimplements what one hyperparameter trial of SpeechBrain-MOABB
 (github.com/speechbrain/benchmarks, benchmarks/MOABB) does, but trains every
