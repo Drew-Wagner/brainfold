@@ -9,15 +9,23 @@ reference model (the hparams file's `fixed` values: Lawhern et al.'s EEGNet-8,2
 with version 1's step-0 training) is trained with the protocol's inner folds, within
 each outer fold's training data, on:
 
-1. `window`: the protocol's window (cue offset to end of imagery);
-2. `cue`: the cue period alone (cue onset to offset, or to 0.5 s if the cue persists);
-3. `window_no_frontal`: the protocol's window without the frontal 10-20 rows
-   (`audit.frontal_rows`: Fp, AF and F).
+1. `window`: the protocol's window (0.5 s after the cue's offset to the end of imagery);
+2. `cue`: the cue period alone (cue onset to offset, or to 0.5 s if the cue persists),
+   in the protocol's band;
+3. `cue_slow`: the cue period below 4 Hz (from the hardware band's low edge, at least
+   0.5 Hz), where visual evoked responses and eye movements have most of their power;
+4. `window_no_frontal`: the protocol's window without the frontal 10-20 rows
+   (`audit.frontal_rows`: Fp, AF and F);
+5. `window_eog`: the EOG channels alone on the protocol's window, if the dataset has
+   any (they're never an input to the search's models).
 
-Accuracy well above chance on 2 says the cue's evoked response or eye movements carry
-the class; a large drop from 1 to 3 says frontal (possibly ocular) activity does. Each
-is reported against the binomial chance threshold for its number of validation trials
-(Combrisson and Jerbi, 2015), pooled and per subject.
+Motor imagery's desynchronization starts about 0.3 s after the cue's onset
+(Pfurtscheller et al., 2008), so 2 holds the cue and early imagery together: above
+chance there is expected, and isn't by itself a confound. The confound tests are 5
+(eye movements that follow the class, if well above chance), 3 (slow cue-locked
+activity) and the drop from 1 to 4 (frontal, possibly ocular or muscle, activity).
+Each is reported against the binomial chance threshold for its number of validation
+trials (Combrisson and Jerbi, 2015), pooled and per subject.
 
 The model trains to a fixed epoch (with schedule-free, the last of `schedule_free.epochs`;
 with Adam, `number_of_epochs`), with no epoch chosen on validation, so the validation
@@ -47,17 +55,25 @@ from tracking import environment, finish_run, start_run, write_csv, write_enviro
 from train import load_hparams
 
 
-def conditions(cfg):
-    """[(name, hyperparameters to set, description)] of the audit's three conditions."""
+def conditions(cfg, n_eog):
+    """[(name, hyperparameters to set, description)] of the audit's conditions (``n_eog``: the EOG channels)."""
     paradigm = cfg["paradigm"]
     (tmin, tmax), (cue_min, cue_max) = protocol.protocol_window(paradigm), protocol.cue_window(paradigm)
     rows = list(cfg.get("audit", {}).get("frontal_rows", ["Fp", "AF", "F"]))
-    return [
+    slow_min = max(0.5, (paradigm.get("hardware_band") or (0, None))[0])
+    conds = [
         ("window", dict(tmin=tmin, tmax=tmax), f"the protocol's window, {tmin:g}-{tmax:g} s"),
-        ("cue", dict(tmin=cue_min, tmax=cue_max), f"the cue period alone, {cue_min:g}-{cue_max:g} s"),
+        ("cue", dict(tmin=cue_min, tmax=cue_max),
+         f"the cue period alone (the cue and early imagery), {cue_min:g}-{cue_max:g} s"),
+        ("cue_slow", dict(tmin=cue_min, tmax=cue_max, fmin=slow_min, fmax=4.0),
+         f"the cue period below 4 Hz, {cue_min:g}-{cue_max:g} s, {slow_min:g}-4 Hz"),
         ("window_no_frontal", dict(tmin=tmin, tmax=tmax, drop_rows=rows),
          f"the protocol's window without the rows {', '.join(rows)}"),
     ]
+    if n_eog:
+        conds.append(("window_eog", dict(tmin=tmin, tmax=tmax, modality="eog"),
+                      f"the {n_eog} EOG channels alone on the protocol's window"))
+    return conds
 
 
 def subject_of(fold):
@@ -109,6 +125,9 @@ def markdown(cfg, info, conds, by_condition, results, alpha):
     if paradigm["cue_offset"] == "persists":
         lines += ["**The cue persists through the imagery: the dataset is cue-confounded** (PROTOCOL.md); the "
                   "window starts 0.5 s after the cue's onset.", ""]
+    lines += ["The cue period holds the cue and early imagery together, so its accuracy above chance isn't by "
+              "itself a confound. The confound tests are the EOG channels alone, the cue period below 4 Hz and "
+              "the drop without the frontal rows.", ""]
     lines += ["| condition | channels | trials | accuracy | balanced accuracy | threshold | above chance | "
               "subjects above their threshold |", "|---|---|---|---|---|---|---|---|"]
     for name, _, description in conds:
@@ -119,10 +138,11 @@ def markdown(cfg, info, conds, by_condition, results, alpha):
                      f"{'yes' if pooled['above_chance'] else 'no'} | "
                      f"{sum(r['above_chance'] for r in subjects)} of {len(subjects)} |")
     drop, se, n = paired_drop(by_condition, "window", "window_no_frontal")
-    cue = next(r for r in by_condition["cue"] if r["subject"] == "all")
-    lines += ["", f"- Cue period alone: accuracy {cue['accuracy']:.3f} against a threshold of {cue['threshold']:.3f} "
-              f"({cue['accuracy'] - cue['threshold']:+.3f}).",
-              f"- Window minus window without the frontal rows: {drop:+.3f} ± {se:.3f} (mean ± standard error over "
+    lines += [""] + [f"- {name}: accuracy {r['accuracy']:.3f} against a threshold of {r['threshold']:.3f} "
+                     f"({r['accuracy'] - r['threshold']:+.3f})."
+                     for name in ("cue", "cue_slow", "window_eog") if name in by_condition
+                     for r in [next(r for r in by_condition[name] if r["subject"] == "all")]]
+    lines += [f"- Window minus window without the frontal rows: {drop:+.3f} ± {se:.3f} (mean ± standard error over "
               f"{n} subjects, paired).", "",
               "Per subject:", "", "| subject | " + " | ".join(name for name, _, _ in conds) + " | trials |",
               "|---|" + "---|" * (len(conds) + 1)]
@@ -166,7 +186,8 @@ def main():
     env = dict(environment(args.device), load_seconds=time.perf_counter() - t0, optimizer=args.optimizer,
                trial_seed=seed_base, **rules)
     paths = [write_environment(args.out / "audit", env)]
-    run = start_run(args.wandb, "sb-audit", args.hparams, cfg, args, env)
+    run = start_run(args.wandb, "sb-audit", args.hparams, cfg, args, env,
+                    **sb_search.run_names(args.hparams, args.out))
     log = sb_search.Logger(run, cfg["metric"])
     print(f"{cfg['dataset']}: recordings of {len(recordings.subjects)} subjects loaded in {env['load_seconds']:.0f}s; "
           f"{rules}", flush=True)
@@ -176,7 +197,7 @@ def main():
         hp["chosen_epochs"] = cfg["schedule_free"]["epochs"]["last"]  # trained to it, evaluated there only
     epochs = hp.get("chosen_epochs", hp["number_of_epochs"])
     seeds = sb_search.trial_seeds(seed_base, settings["seeds_per_trial"], 0, settings["trial_seeds"] == "per_trial")
-    conds = conditions(cfg)
+    conds = conditions(cfg, len(recordings.eog_names))
     cells, by_condition, results = [], {}, {}
     for name, values, description in conds:
         result = sb_search.run_trial(dict(hp, **values), seeds, recordings, cfg, args, f"audit/{name}", settings)
@@ -192,7 +213,7 @@ def main():
               f"{result['train_seconds']:.0f}s training, {result['data_seconds']:.0f}s data, "
               f"{result['peak_allocated'] / 2**30:.1f} GiB", flush=True)
         n_train = int(result["rows"][0]["n_train"])
-        log.trial(f"audit/{name}", result, {k: v for k, v in values.items() if k != "drop_rows"}, float("nan"),
+        log.trial(f"audit/{name}", result, {k: v for k, v in values.items() if k not in ("drop_rows", "modality")}, float("nan"),
                   float("nan"), sb_search.epoch_lr(hp, args.optimizer, n_train), (result["params"], result["flops"]))
         if run is not None:
             run.log({f"audit/{name}/accuracy": pooled["accuracy"], f"audit/{name}/threshold": pooled["threshold"],

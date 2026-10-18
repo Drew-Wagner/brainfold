@@ -57,14 +57,18 @@ def write_environment(out, env):
     return path
 
 
-def start_run(project, job_type, hparams_path, hparams, args, env):
-    """A W&B run, or None when ``project`` is None. Set WANDB_MODE=offline and sync later on clusters."""
+def start_run(project, job_type, hparams_path, hparams, args, env, group=None, name=None, tags=None):
+    """A W&B run, or None when ``project`` is None. Set WANDB_MODE=offline and sync later on clusters.
+
+    ``group`` defaults to the hparams file's name; ``name`` and ``tags`` are W&B's.
+    """
     if project is None:
         return None
     import wandb
 
     config = dict(hparams=hparams, args={k: str(v) for k, v in vars(args).items()}, environment=env)
-    return wandb.init(project=project, job_type=job_type, group=Path(hparams_path).stem, config=config)
+    return wandb.init(project=project, job_type=job_type, group=group or Path(hparams_path).stem, name=name,
+                      tags=tags, config=config)
 
 
 def finish_run(run, rows, paths, summary=None):

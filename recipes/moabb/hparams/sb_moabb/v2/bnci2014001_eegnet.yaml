@@ -10,7 +10,7 @@
 # ---- the dataset (per dataset) ----
 dataset: BNCI2014_001
 n_classes: 4
-sample_rate: 125  # Hz: SpeechBrain-MOABB's, over 3x the band's upper edge; lowered to the recording's if that's lower
+sample_rate: 125  # Hz: SpeechBrain-MOABB's, over 4x the band's upper edge; lowered to the recording's if that's lower
 valid_ratio: 0.2  # unused (inner folds)
 
 # ---- the paradigm (per dataset; PROTOCOL.md, "Inputs from each dataset") ----
@@ -39,7 +39,7 @@ pack_size: 36  # cells per pack, as version 1 (packs that run out of memory spli
 
 protocol:
   # Preprocessing by rule (PROTOCOL.md, "Preprocessing: fixed, not searched"): the window from
-  # the cue's offset to the end of imagery (from the paradigm block), every EEG channel.
+  # 0.5 s after the cue's offset to the end of imagery (from the paradigm block), every EEG channel.
   window: paradigm
   channels: all
   # Splits by rule (PROTOCOL.md, "Splits, by rule"): leave one session out, a single session
@@ -53,6 +53,7 @@ protocol:
   seed_per_inner_fold: true
   trial_seeds: per_trial
   selection: one_se
+  se: paired  # new in version 2: the standard error of each trial's difference from the best, paired by inner fold
   size: params
   multi_objective: false
   nested_by_test_session: true
@@ -62,10 +63,12 @@ protocol:
 # Values a step doesn't search. The model and training are version 1's reference (step 0's),
 # which the audit trains and step 1 starts from.
 fixed:
-  # the band, by rule: motor imagery's mu and beta rhythms, as FBCSP's 4-40 Hz (PROTOCOL.md);
-  # tmin and tmax are set from the paradigm block
+  # the band, by rule (PROTOCOL.md): motor imagery's mu and beta rhythms, 8-30 Hz (Blankertz et
+  # al., 2008), from 4 Hz, where eye movements have most of their power below (Schirrmeister et
+  # al., 2017), to 30 Hz, above which it's mostly muscle (Goncharova et al., 2003); tmin and tmax
+  # are set from the paradigm block
   fmin: 4.0
-  fmax: 40.0
+  fmax: 30.0
   # training (Adam only: with schedule-free these aren't used): the middle of their priors
   number_of_epochs: 625
   avg_models: 8
@@ -87,8 +90,9 @@ fixed:
   dropout: 0.5  # Lawhern et al.'s for within-subject decoding
 
 # The confound audit (sb_audit.py; PROTOCOL.md, "The confound audit"): the reference model
-# above with the protocol's inner folds, on the protocol's window, the cue period alone, and
-# the window without the frontal rows. Reported, never used for selection.
+# above with the protocol's inner folds, on the protocol's window, the cue period alone (in the
+# band and below 4 Hz), the window without the frontal rows, and the EOG channels alone on the
+# window. Reported, never used for selection.
 audit:
   frontal_rows: [Fp, AF, F]  # 10-20 rows; FC and FT (fronto-central and -temporal) are kept
   alpha: 0.05  # the binomial chance threshold's level (Combrisson and Jerbi, 2015)

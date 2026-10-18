@@ -321,8 +321,14 @@ would keep the early window and make the cue signal hard or costly to use:
 
 - **Channel swapping:** during training, swap or shuffle the ocular and
   frontal channels (EOG, Fp/AF) between trials of different classes, so they
-  can't carry the class. If EOG channels are recorded, regressing them out
-  is the classical version.
+  can't carry the class.
+- **Regressing out EOG:** the classical correction (Gratton, Coles and
+  Donchin, 1983; review: Croft and Barry, 2000), with an automated version
+  built on Graz motor-imagery data and each session's EOG calibration block
+  (Schlögl et al., 2007). It needs recorded EOG channels (BNCI2015001, Zhou2016
+  and Lee2019_MI have none in MOABB), also removes some EEG (Jung et al.,
+  2000), and doesn't touch the cortical response to the cue. Fitting on the
+  calibration block needs no labels and no test-session task trials.
 - **A penalty on low tmin:** if the window is searched, a prior or cost on
   windows that overlap the cue period (as in πBO's user beliefs, or as a term
   in the objective), so the search takes the cue period only when it pays

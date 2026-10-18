@@ -29,13 +29,13 @@ BNCI2014001 = ["Fz", "FC3", "FC1", "FCz", "FC2", "FC4", "C5", "C3", "C1", "Cz", 
 
 def test_window_from_the_paradigm_block():
     paradigm = dict(cue_onset=0.0, cue_offset=1.25, imagery_end=4.0)  # BNCI2014001
-    assert protocol.protocol_window(paradigm) == (1.25, 4.0)
+    assert protocol.protocol_window(paradigm) == (1.75, 4.0)
     assert protocol.cue_window(paradigm) == (0.0, 1.25)
     persists = dict(cue_onset=1.0, cue_offset="persists", imagery_end=5.0)  # e.g. a cue shown through the imagery
     assert protocol.protocol_window(persists) == (1.5, 5.0)
     assert protocol.cue_window(persists) == (1.0, 1.5)
     with pytest.raises(ValueError):
-        protocol.protocol_window(dict(cue_onset=0.0, cue_offset=3.0, imagery_end=3.0))
+        protocol.protocol_window(dict(cue_onset=0.0, cue_offset=2.5, imagery_end=3.0))
 
 
 class FakeRecordings:
@@ -66,10 +66,10 @@ class FakeRecordings:
     def recording_rates(self):
         return [self._rate]
 
-    def trials(self, fmin, fmax, sample_rate=None):
+    def trials(self, fmin, fmax, sample_rate=None, modality="eeg"):
         return self.X, self.y, *self.meta[:2]
 
-    def runs(self, fmin, fmax, sample_rate=None):
+    def runs(self, fmin, fmax, sample_rate=None, modality="eeg"):
         return self.meta[2]
 
     def interval(self):
@@ -86,9 +86,9 @@ def test_apply_paradigm_sets_the_window_and_rate():
     settings = dict(sb_search.PROTOCOL, **cfg["protocol"])
     recordings = FakeRecordings(bnci2014001_like())
     rules = sb_search.apply_paradigm(cfg, settings, recordings)
-    assert rules["tmin"] == 1.25 and rules["tmax"] == 4.0 and rules["sample_rate"] == 125
-    assert cfg["fixed"]["tmin"] == 1.25 and cfg["fixed"]["tmax"] == 4.0 and "twindow" not in cfg["fixed"]
-    assert (cfg["fixed"]["fmin"], cfg["fixed"]["fmax"]) == (4.0, 40.0)
+    assert rules["tmin"] == 1.75 and rules["tmax"] == 4.0 and rules["sample_rate"] == 125
+    assert cfg["fixed"]["tmin"] == 1.75 and cfg["fixed"]["tmax"] == 4.0 and "twindow" not in cfg["fixed"]
+    assert (cfg["fixed"]["fmin"], cfg["fixed"]["fmax"]) == (4.0, 30.0)
     # a dataset recorded below 125 Hz keeps its rate; the paradigm block must say so
     cfg = load_hparams(V2, ["paradigm.recording_rate=100"])
     recordings = FakeRecordings(bnci2014001_like(), rate=100.0)
@@ -281,6 +281,46 @@ def test_one_se_counts_transforms():
     assert sb_search.select([none, better, fewer, tie], "one_se", "n_transforms")[0].number == 5
 
 
+def test_one_se_paired():
+    def trial(number, value, per_inner, params):
+        means = np.array(list(per_inner.values()))
+        se = float(means.std(ddof=1) / np.sqrt(len(means)))
+        return SimpleNamespace(number=number, values=[value],
+                               user_attrs=dict(se=se, params=params, per_inner={str(k): v for k, v in per_inner.items()}))
+
+    # folds differ in difficulty much more than the trials do: the unpaired SE (about 0.07) admits the
+    # smaller trial, the paired one (0.001) doesn't, since it's lower on every fold
+    best = trial(0, 0.75, {0: 0.65, 1: 0.75, 2: 0.85}, 1000)
+    smaller = trial(1, 0.73, {0: 0.631, 1: 0.73, 2: 0.829}, 100)
+    assert sb_search.select([best, smaller], "one_se", "params")[0].number == 1
+    assert sb_search.select([best, smaller], "one_se", "params", "paired")[0].number == 0
+    # a difference that varies across folds as much as its size: within one paired SE
+    noisy = trial(2, 0.74, {0: 0.68, 1: 0.70, 2: 0.84}, 100)
+    assert sb_search.paired_se(best, noisy) > 0.01
+    assert sb_search.select([best, noisy], "one_se", "params", "paired")[0].number == 2
+    with pytest.raises(ValueError):
+        sb_search.select([best, smaller], "one_se", "params", "other")
+
+
+def test_final_seeds_differ_between_replicates():
+    first, second = (sb_search.trial_seeds(base, 10, sb_search.FINAL_TRIAL, True) for base in (1, 2))
+    assert len(set(first)) == 10 and not set(first) & set(second)
+    assert sb_search.trial_seeds(1986, 3, sb_search.FINAL_TRIAL, False) == [1986, 1987, 1988]  # the reproduction's
+
+
+def test_audit_conditions():
+    import sb_audit
+
+    cfg = load_hparams(V2, [])
+    conds = {name: values for name, values, _ in sb_audit.conditions(cfg, 3)}
+    assert list(conds) == ["window", "cue", "cue_slow", "window_no_frontal", "window_eog"]
+    assert (conds["window"]["tmin"], conds["window"]["tmax"]) == (1.75, 4.0)
+    assert (conds["cue"]["tmin"], conds["cue"]["tmax"]) == (0.0, 1.25)
+    assert (conds["cue_slow"]["fmin"], conds["cue_slow"]["fmax"]) == (0.5, 4.0)
+    assert conds["window_eog"]["modality"] == "eog"
+    assert "window_eog" not in [name for name, _, _ in sb_audit.conditions(cfg, 0)]
+
+
 def test_v1_and_reproduction_files_keep_their_settings():
     """Version 1's and the reproduction's yaml files don't turn on version 2's options."""
     root = V2.parents[1]
@@ -289,7 +329,7 @@ def test_v1_and_reproduction_files_keep_their_settings():
         settings = dict(sb_search.PROTOCOL, **cfg.get("protocol", {}))
         assert (settings["window"], settings["channels"], settings["outer_folds"]) == ("hparams", "adjacency",
                                                                                         "sessions")
-        assert settings["inner_folds"] != "rule"
+        assert settings["inner_folds"] != "rule" and settings["se"] == "unpaired"
         assert all(s.get("first_trial") is None and s.get("size") is None for s in sb_search.steps_of(cfg).values())
 
 

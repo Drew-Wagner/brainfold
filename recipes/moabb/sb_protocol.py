@@ -59,7 +59,8 @@ class Recordings:
     ``trials(fmin, fmax)`` equals ``MotorImagery(n_classes, fmin=fmin, fmax=fmax,
     resample=sample_rate).get_data(dataset)`` (SpeechBrain-MOABB's prepare.py) without
     reloading the files; its last few results are cached. ``runs`` gives each trial's
-    run, for validation folds of whole runs (``inner_folds``).
+    run, for validation folds of whole runs (``inner_folds``). ``modality="eog"`` gives the
+    EOG channels instead, preprocessed the same way (the audit's EOG condition only).
     """
 
     def __init__(self, dataset, n_classes, sample_rate, subjects=None, threads=8):
@@ -72,6 +73,7 @@ class Recordings:
         first = next(iter(next(iter(self.raws.values())).values())).values()
         raw = next(iter(first))
         self.info = raw.copy().pick("eeg").info
+        self.eog_names = raw.copy().pick("eog").ch_names
         self.channel_types = raw.get_channel_types()
         self._cache = {}
 
@@ -85,20 +87,22 @@ class Recordings:
         return sorted({raw.info["sfreq"] for sessions in self.raws.values() for by_run in sessions.values()
                        for raw in by_run.values()})
 
-    def trials(self, fmin, fmax, sample_rate=None):
+    def trials(self, fmin, fmax, sample_rate=None, modality="eeg"):
         """Trials (n, n_chans, n_times) float32, labels from 0, subjects and sessions.
 
         ``sample_rate`` resamples to another rate than the one given at construction.
         """
-        return self._preprocessed(fmin, fmax, sample_rate)[:4]
+        return self._preprocessed(fmin, fmax, sample_rate, modality)[:4]
 
-    def runs(self, fmin, fmax, sample_rate=None):
+    def runs(self, fmin, fmax, sample_rate=None, modality="eeg"):
         """Each trial's run (MOABB's run name), aligned with ``trials``."""
-        return self._preprocessed(fmin, fmax, sample_rate)[4]
+        return self._preprocessed(fmin, fmax, sample_rate, modality)[4]
 
-    def _preprocessed(self, fmin, fmax, sample_rate):
+    def _preprocessed(self, fmin, fmax, sample_rate, modality="eeg"):
         sample_rate = sample_rate or self.sample_rate
         key = (fmin, fmax) if sample_rate == self.sample_rate else (fmin, fmax, sample_rate)
+        if modality != "eeg":
+            key += (modality,)
         if key not in self._cache:
             from moabb.paradigms import MotorImagery
 
@@ -109,7 +113,7 @@ class Recordings:
             runs = [(subject, session, run, raw) for subject, sessions in self.raws.items()
                     for session, by_run in sessions.items() for run, raw in by_run.items()]
             with ThreadPoolExecutor(self.threads) as pool:  # MNE's filtering releases the GIL
-                outputs = list(pool.map(lambda run: pipeline.transform(run[3].copy()), runs))
+                outputs = list(pool.map(lambda run: pipeline.transform(self._raw(run[3], modality)), runs))
             X, labels, subjects, sessions, run_names = [], [], [], [], []
             for (subject, session, run, _), out in zip(runs, outputs):
                 if out is None:  # no selected event in this run
@@ -126,6 +130,16 @@ class Recordings:
             self._cache[key] = (np.concatenate(X), codes - codes.min(), np.array(subjects), np.array(sessions),
                                 np.array(run_names))
         return self._cache[key]
+
+    def _raw(self, raw, modality):
+        """A copy of ``raw`` for MOABB's pipeline, which keeps EEG channels: as is, or its EOG channels typed as EEG."""
+        if modality == "eeg":
+            return raw.copy()
+        if modality != "eog":
+            raise ValueError(f"unknown modality {modality!r}")
+        raw = raw.copy().pick(["eog", "stim"])
+        raw.set_channel_types({name: "eeg" for name in self.eog_names}, on_unit_change="ignore")
+        return raw
 
     def channels(self, n_steps, seed_nodes=("Cz",)):
         """Indices of the electrodes SpeechBrain-MOABB keeps with ``n_steps_channel_selection``."""
@@ -149,25 +163,27 @@ class Recordings:
 
 # ---- version 2's rules from each dataset's metadata (PROTOCOL.md) ------------------------------------
 
-def protocol_window(paradigm, after_onset=0.5):
-    """(tmin, tmax) in seconds from MOABB's epoch start: the cue's offset to the end of imagery.
+def protocol_window(paradigm, margin=0.5):
+    """(tmin, tmax) in seconds from MOABB's epoch start: ``margin`` s after the cue's offset to the end of imagery.
 
     ``paradigm`` is the hparams file's ``paradigm`` block: ``cue_onset``, ``cue_offset``
-    (seconds, or "persists") and ``imagery_end``, all from MOABB's epoch start. If the cue
-    persists through the imagery, the window starts ``after_onset`` seconds after its
-    onset, past the main visual evoked response.
+    (seconds, or "persists") and ``imagery_end``, all from MOABB's epoch start. The margin
+    skips the visual response to the cue's removal (the ISCEV VEP standard leaves 400 ms for
+    the pattern-offset response; Odom et al., 2016) and the band-pass filter's spread. If
+    the cue persists through the imagery, the window starts ``margin`` s after its onset,
+    past the main visual evoked response.
     """
     onset, offset, end = paradigm["cue_onset"], paradigm["cue_offset"], paradigm["imagery_end"]
-    tmin = onset + after_onset if offset == "persists" else offset
+    tmin = (onset if offset == "persists" else offset) + margin
     if not tmin < end:
         raise ValueError(f"empty window: from {tmin} s to the end of imagery at {end} s")
     return float(tmin), float(end)
 
 
-def cue_window(paradigm, after_onset=0.5):
-    """(tmin, tmax) of the cue period: onset to offset, or onset to ``after_onset`` s if the cue persists."""
+def cue_window(paradigm, margin=0.5):
+    """(tmin, tmax) of the cue period: onset to offset, or onset to ``margin`` s if the cue persists."""
     onset, offset = paradigm["cue_onset"], paradigm["cue_offset"]
-    return float(onset), float(onset + after_onset if offset == "persists" else offset)
+    return float(onset), float(onset + margin if offset == "persists" else offset)
 
 
 def check_paradigm(paradigm, recordings, sample_rate, fmin, fmax):

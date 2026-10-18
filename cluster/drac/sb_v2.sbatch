@@ -1,6 +1,6 @@
 #!/bin/bash
 # Version 2 of the search protocol (recipes/moabb/PROTOCOL.md) with schedule-free AdamW:
-# preprocessing fixed by rule (4-40 Hz, 125 Hz, the window from the paradigm block, every
+# preprocessing fixed by rule (4-30 Hz, 125 Hz, the window from the paradigm block, every
 # EEG channel), step 1 (architecture and training) and step 2 (EEG augmentation, no
 # augmentation as its first trial), 50 TPE trials each, then 10 seeds over the folds.
 # Selection is nested by test session: one search per test session, run as separate array
@@ -27,12 +27,14 @@
 # about 5.9 h on the RTX 4080 SUPER. On 2g.20gb, version 1's step 0 (job 65435553: 50
 # trials of EEGNet-8,2 on 54 cells in about 3 h, 216 s per trial) took about 2.6x the RTX
 # 4080 SUPER's time for the same trial (README: 70 s training and 13 s preprocessing), so
-# about 15 h per task. 24 h asks for about 1.6x that; the search resumes if it doesn't finish.
+# about 15 h per task. Version 1 on 2g.20gb took 13 h 48 min and 15 h 39 min per task with its
+# step 0 (job 65435553), about 12-13.5 h without it, so 15 h is if anything high. 21 h asks for
+# about 1.4x the 15 h (1.6x version 1 without step 0); the search resumes if it doesn't finish.
 #SBATCH --job-name=brainfold-sb-v2
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --time=24:00:00
+#SBATCH --time=21:00:00
 #SBATCH --output=%x-%A_%a.out
 set -euo pipefail
 source "$SLURM_SUBMIT_DIR/cluster/drac/env.sh"
@@ -50,8 +52,9 @@ out=$results-r$replicate/test-$session
 mkdir -p "$out"
 cd "$REPO/recipes/moabb"
 if [ "$SLURM_ARRAY_TASK_ID" -eq 0 ] && [ ! -e "$results-audit/audit.md" ]; then
+  # the audit is reported, never used by the search: if it fails, the search still runs
   python sb_audit.py "hparams/sb_moabb/v2/$config.yaml" --optimizer schedule-free --out "$results-audit" \
-    --wandb "$BRAINFOLD_WANDB_PROJECT"
+    --wandb "$BRAINFOLD_WANDB_PROJECT" || echo "the audit failed (exit $?); running the search" >&2
 fi
 python sb_search.py "hparams/sb_moabb/v2/$config.yaml" --optimizer schedule-free --out "$out" \
   --test-session "$session" "${seeds[@]}" --wandb "$BRAINFOLD_WANDB_PROJECT" "$@"

@@ -135,6 +135,8 @@ PROTOCOL = dict(  # SpeechBrain-MOABB's
     trial_seeds="fixed",  # every trial uses seeds seed, seed + 1, ...; or "per_trial"
     seed_per_inner_fold=False,  # True: each inner fold trains from its own seed, derived from the trial's
     selection="best",  # or "one_se"
+    se="unpaired",  # one_se's standard error: of the best trial over its replicates; or "paired": of each
+    # trial's difference from the best, paired by inner fold
     size="params",  # or "flops": the size one_se and multi_objective minimize
     multi_objective=False,
     nested_by_test_session=False,  # True: one search per test session, on the folds that test on it
@@ -145,6 +147,18 @@ PROTOCOL = dict(  # SpeechBrain-MOABB's
     channels="adjacency",  # or "all": every EEG channel (EOG dropped), no selection around Cz
     outer_folds="sessions",  # or "rule": a subject's single session split into two pseudo-sessions
 )
+
+
+def run_names(hparams_path, out):
+    """W&B's group, name and tags for a search: the protocol (the hparams file's directory, e.g.
+    v2), the results directory and its parent (e.g. bnci2014001_eegnet-r0/test-0train)."""
+    protocol_name, stem = Path(hparams_path).parent.name, Path(hparams_path).stem
+    out = Path(out)
+    return dict(group=f"{protocol_name}-{stem}", name=f"{protocol_name}/{out.parent.name}/{out.name}",
+                tags=[protocol_name, out.parent.name, out.name])
+
+
+FINAL_TRIAL = 2**31 - 1  # the final evaluation's trial number for its seeds, past any search trial's
 
 
 def trial_seeds(base, n, number, per_trial):
@@ -159,11 +173,13 @@ def trial_seeds(base, n, number, per_trial):
 def prepare(hp, recordings, cfg, args, settings=PROTOCOL):
     """The trial's data on the device, its sample rate and its leave-one-session-out folds.
 
-    ``hp["drop_rows"]``, a list of 10-20 rows (e.g. Fp, AF, F), drops those channels (the audit).
+    ``hp["drop_rows"]``, a list of 10-20 rows (e.g. Fp, AF, F), drops those channels, and
+    ``hp["modality"] = "eog"`` uses the EOG channels instead of the EEG (both for the audit).
     """
     sample_rate = hp.get("sample_rate", cfg["sample_rate"])
-    X, y, subjects, sessions = recordings.trials(hp["fmin"], hp["fmax"], sample_rate)
-    runs = recordings.runs(hp["fmin"], hp["fmax"], sample_rate)
+    modality = hp.get("modality", "eeg")
+    X, y, subjects, sessions = recordings.trials(hp["fmin"], hp["fmax"], sample_rate, modality)
+    runs = recordings.runs(hp["fmin"], hp["fmax"], sample_rate, modality)
     if settings["outer_folds"] == "rule":
         sessions = protocol.pseudo_sessions(subjects, sessions, runs)
     elif settings["outer_folds"] != "sessions":
@@ -172,7 +188,10 @@ def prepare(hp, recordings, cfg, args, settings=PROTOCOL):
     tmax = min(hp["tmin"] + hp["twindow"], interval[1]) if "twindow" in hp else hp["tmax"]
     X = protocol.crop(X, sample_rate, interval, hp["tmin"], tmax)
     names = list(recordings.info.ch_names)
-    if settings["channels"] == "adjacency":
+    if modality == "eog":
+        names = list(recordings.eog_names)
+        keep = np.arange(len(names))
+    elif settings["channels"] == "adjacency":
         keep = recordings.channels(hp["n_steps_channel_selection"])
     elif settings["channels"] == "all":
         keep = np.arange(len(names))
@@ -444,7 +463,21 @@ def size_of(trial, size):
     return trial.user_attrs[size]
 
 
-def select(trials, rule, size):
+def paired_se(best, trial):
+    """The standard error of ``best``'s objective minus ``trial``'s, paired by inner fold; NaN if unknown.
+
+    Every trial validates on the same inner folds, so the difference between two trials
+    cancels how hard each fold is, which the unpaired standard error counts as noise.
+    """
+    a, b = best.user_attrs.get("per_inner") or {}, trial.user_attrs.get("per_inner") or {}
+    folds = sorted(set(a) & set(b))
+    if len(folds) < 2:
+        return float("nan")
+    d = np.array([a[j] - b[j] for j in folds])
+    return float(d.std(ddof=1) / math.sqrt(len(d)))
+
+
+def select(trials, rule, size, se_kind="unpaired"):
     """The trial to keep from a step's finished trials, and why.
 
     ``best``: the highest objective. ``one_se``: the smallest (``size``: params, flops
@@ -452,6 +485,8 @@ def select(trials, rule, size):
     et al., 1984; Hastie et al., 2009, section 7.10), the best when its standard error is
     unknown; ties in size go to the higher objective. With ``n_transforms``, no
     augmentation is kept unless augmentation beats it by more than one standard error.
+    ``se_kind="paired"``: the standard error of each trial's difference from the best,
+    paired by inner fold (``paired_se``), instead of the best's own.
     """
     best = max(trials, key=lambda t: t.values[0])
     se = best.user_attrs.get("se", float("nan"))
@@ -459,6 +494,13 @@ def select(trials, rule, size):
         return best, "best"
     if rule != "one_se":
         raise ValueError(f"unknown selection {rule!r}")
+    if se_kind == "paired":
+        within = [t for t in trials if t is best or best.values[0] - t.values[0] <= paired_se(best, t)]
+        chosen = min(within, key=lambda t: (size_of(t, size), -t.values[0]))
+        return chosen, (f"one_se (paired): smallest {size} of {len(within)} trials within one paired standard "
+                        f"error of trial {best.number}")
+    if se_kind != "unpaired":
+        raise ValueError(f"unknown se {se_kind!r}")
     within = [t for t in trials if t.values[0] >= best.values[0] - se]
     chosen = min(within, key=lambda t: (size_of(t, size), -t.values[0]))
     return chosen, f"one_se: smallest {size} of {len(within)} trials within {se:.4f} of trial {best.number}"
@@ -670,7 +712,7 @@ def main():
     env = dict(environment(args.device), load_seconds=time.perf_counter() - t0, optimizer=args.optimizer,
                tpe_seed=tpe_seed, trial_seed=seed_base, **(rules or {}))
     paths = [write_environment(args.out / "results", env)]
-    run = start_run(args.wandb, "sb-protocol", args.hparams, cfg, args, env)
+    run = start_run(args.wandb, "sb-protocol", args.hparams, cfg, args, env, **run_names(args.hparams, args.out))
     log = Logger(run, cfg["metric"])
     metric = cfg["metric"]
     print(f"{cfg['dataset']}: recordings of {len(recordings.subjects)} subjects loaded in {env['load_seconds']:.0f}s; "
@@ -780,7 +822,7 @@ def search(args, cfg, steps, settings, recordings, log, tpe_seed, seed_base, pat
             n_train = int(result["rows"][0]["n_train"])
             log.trial(prefix + step, result, values, test, best, epoch_lr(trial_hp, args.optimizer, n_train), size)
         chosen, why = select(complete(), step_settings.get("selection", settings["selection"]),
-                             step_settings.get("size", settings["size"]))
+                             step_settings.get("size", settings["size"]), settings["se"])
         hp.update(chosen.user_attrs["values"])
         if sf:
             hp["chosen_epochs"] = chosen.user_attrs["epoch"]
@@ -800,7 +842,8 @@ def search(args, cfg, steps, settings, recordings, log, tpe_seed, seed_base, pat
 
     # Final evaluation: every fold with final_seeds seeds, on the test sessions, with augmentation
     hp["augment"] = settings["final_augment"]
-    seeds = [seed_base + i for i in range(cfg["final_seeds"])]
+    # with per-trial seeds, drawn from (seed_base, FINAL_TRIAL), so replicate searches don't share them
+    seeds = trial_seeds(seed_base, cfg["final_seeds"], FINAL_TRIAL, settings["trial_seeds"] == "per_trial")
     result = run_trial(hp, seeds, recordings, cfg, args, "final", settings, final=True)
     final_rows = [dict(step="final", **row) for row in result["rows"]]
     write_csv(args.out / "final.csv", final_rows)

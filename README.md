@@ -445,11 +445,11 @@ gone), and applies unchanged to a new dataset from that dataset's metadata.
 `hparams/sb_moabb/v2/bnci2014001_eegnet.yaml` turns it on; every option is off
 by default, so the files above run as before.
 
-- **Preprocessing by rule**: 4-40 Hz, 125 Hz (or the recording's rate, if
+- **Preprocessing by rule**: 4-30 Hz, 125 Hz (or the recording's rate, if
   lower), every EEG channel (`protocol.channels: all`), and the window from
-  the cue's offset to the end of imagery, read from the hparams file's
-  `paradigm` block (`protocol.window: paradigm`; 1.25-4.0 s after the cue on
-  BNCI2014001). The block's counts and rate are checked against MOABB's
+  0.5 s after the cue's offset to the end of imagery, read from the hparams
+  file's `paradigm` block (`protocol.window: paradigm`; 1.75-4.0 s after the
+  cue on BNCI2014001). The block's counts and rate are checked against MOABB's
   metadata, and the search stops if they differ.
 - **Splits by rule**: a subject with one session gets two pseudo-sessions
   (`protocol.outer_folds: rule`); one validation fold per run of the
@@ -458,9 +458,11 @@ by default, so the files above run as before.
 - **Step 2** starts with no augmentation (`first_trial: all_off`), and the
   one-standard-error rule counts the transforms on (`size: n_transforms`), so
   augmentation is kept only if it's better by more than one standard error.
+  The standard error is paired by inner fold (`protocol.se: paired`).
 - **The confound audit** (`sb_audit.py`), before the search: EEGNet-8,2 on
-  the protocol's window, on the cue period alone, and on the window without
-  the frontal channels, against the binomial chance threshold. Reported, never
+  the protocol's window, on the cue period alone (in the band and below
+  4 Hz), on the window without the frontal channels, and on the EOG channels
+  alone, against the binomial chance threshold. Reported, never
   used for selection.
 
     python sb_audit.py hparams/sb_moabb/v2/bnci2014001_eegnet.yaml --out results/sb/v2-audit
