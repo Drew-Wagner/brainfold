@@ -312,6 +312,31 @@ of 9 folds, the same number of models as one search of 18 (half the cells
 per trial, the same trials per search). `--test-session` runs one of them
 alone, e.g. as separate jobs. Off by default; on in the improved yaml.
 
+### 12. Penalizing the visual confound softly, not cutting it out
+
+Version 2 starts the window after the cue ends. That is the cleanest test of
+whether a model or protocol learns motor imagery, but not necessarily the best
+setting for a BCI, which would use the earliest useful data. A softer option
+would keep the early window and make the cue signal hard or costly to use:
+
+- **Channel swapping:** during training, swap or shuffle the ocular and
+  frontal channels (EOG, Fp/AF) between trials of different classes, so they
+  can't carry the class. If EOG channels are recorded, regressing them out
+  is the classical version.
+- **A penalty on low tmin:** if the window is searched, a prior or cost on
+  windows that overlap the cue period (as in πBO's user beliefs, or as a term
+  in the objective), so the search takes the cue period only when it pays
+  for it.
+- **An adversarial head:** a gradient-reversal branch that tries to predict
+  a cue-locked signal (the evoked response, or EOG), so the features learn
+  to ignore it.
+- **Masking the cue period:** a time mask on the cue period, applied with
+  some probability during training.
+
+Each of these changes what is being measured, so it would be a separate
+protocol, compared against version 2's hard rule, and the audit would show
+how much of the cue each one removes. Not planned for version 2.
+
 ## What makes this affordable now
 
 - SpeechBrain-MOABB's README gives about 8 h on a V100 for one full training
