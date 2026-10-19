@@ -39,6 +39,8 @@
 set -euo pipefail
 source "$SLURM_SUBMIT_DIR/cluster/drac/env.sh"
 source "$BRAINFOLD_VENV/bin/activate"
+# fail fast on a node whose GPU torch can't reach (job 65792547_0 ran 18 h on the CPU on fc10715)
+python -c "import torch; assert torch.cuda.is_available(), 'no GPU visible to torch on $(hostname)'"
 config=${SB_CONFIG:-bnci2014001_eegnet}
 read -r -a sessions <<< "${SESSIONS:-0train 1test}"
 session=${sessions[$((SLURM_ARRAY_TASK_ID % ${#sessions[@]}))]}
