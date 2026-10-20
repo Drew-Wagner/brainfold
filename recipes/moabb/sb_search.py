@@ -50,6 +50,9 @@ as before; the hparams files under hparams/sb_moabb/improved/ turn them on):
   3 runs); per step, `size: n_transforms` (the one-SE rule counts the augmentations
   on) and `first_trial: all_off` (the first trial has no augmentation). sb_audit.py
   runs the confound audit.
+- Version 2 cross-subject (hparams/sb_moabb/v2_xsub/): `outer_folds: subject_groups`
+  (`outer_groups` consecutive groups of test subjects, nested: one search per group)
+  and `inner_folds: subjects` (leave one training subject out).
 
 A trial's unit of work is a cell, one (outer fold, inner fold, seed): `make_cells`
 lists a trial's cells and `train_cells` trains any list of them in packs, so an
@@ -145,7 +148,9 @@ PROTOCOL = dict(  # SpeechBrain-MOABB's
     # version 2 (PROTOCOL.md), each off by default:
     window="hparams",  # or "paradigm": tmin and tmax from the `paradigm` block, and the sample rate at most the recording's
     channels="adjacency",  # or "all": every EEG channel (EOG dropped), no selection around Cz
-    outer_folds="sessions",  # or "rule": a subject's single session split into two pseudo-sessions
+    outer_folds="sessions",  # or "rule": a subject's single session split into two pseudo-sessions;
+    # or "subject_groups": cross-subject, the subjects in `outer_groups` consecutive test groups
+    outer_groups=3,
 )
 
 
@@ -171,7 +176,8 @@ def trial_seeds(base, n, number, per_trial):
 # ---- one trial: every cell, packed -----------------------------------------------------------------
 
 def prepare(hp, recordings, cfg, args, settings=PROTOCOL):
-    """The trial's data on the device, its sample rate and its leave-one-session-out folds.
+    """The trial's data on the device, its sample rate and its outer folds (leave one session out, or
+    with ``outer_folds: subject_groups`` leave a group of subjects out).
 
     ``hp["drop_rows"]``, a list of 10-20 rows (e.g. Fp, AF, F), drops those channels, and
     ``hp["modality"] = "eog"`` uses the EOG channels instead of the EEG (both for the audit).
@@ -182,7 +188,7 @@ def prepare(hp, recordings, cfg, args, settings=PROTOCOL):
     runs = recordings.runs(hp["fmin"], hp["fmax"], sample_rate, modality)
     if settings["outer_folds"] == "rule":
         sessions = protocol.pseudo_sessions(subjects, sessions, runs)
-    elif settings["outer_folds"] != "sessions":
+    elif settings["outer_folds"] not in ("sessions", "subject_groups"):
         raise ValueError(f"unknown outer_folds {settings['outer_folds']!r}")
     interval = recordings.interval()
     tmax = min(hp["tmin"] + hp["twindow"], interval[1]) if "twindow" in hp else hp["tmax"]
@@ -200,12 +206,15 @@ def prepare(hp, recordings, cfg, args, settings=PROTOCOL):
     if hp.get("drop_rows"):
         keep = np.intersect1d(keep, protocol.without_rows(names, hp["drop_rows"]))
     X = X[:, keep]
-    folds = protocol.leave_one_session_out(y, subjects, sessions, cfg["valid_ratio"])
-    if getattr(args, "test_session", None) is not None:  # a search nested by test session: its folds only
+    if settings["outer_folds"] == "subject_groups":
+        folds = protocol.leave_subject_group_out(subjects, settings["outer_groups"])
+    else:
+        folds = protocol.leave_one_session_out(y, subjects, sessions, cfg["valid_ratio"])
+    if getattr(args, "test_session", None) is not None:  # a search nested by test session (or group): its folds only
         folds = testing_on(folds, args.test_session)
     X = torch.from_numpy(X).to(args.device)
     return dict(X=X, Xn=protocol.standardize(X), y=torch.from_numpy(y).to(args.device), folds=folds,
-                sessions=sessions, runs=runs, y_np=y, sample_rate=sample_rate, channels=[names[i] for i in keep])
+                sessions=sessions, runs=runs, subjects=subjects, y_np=y, sample_rate=sample_rate, channels=[names[i] for i in keep])
 
 
 def testing_on(folds, session):
@@ -217,7 +226,8 @@ def make_cells(data, seeds, settings, final=False):
     """Every cell of a trial, (outer fold, inner fold, seed), in the order they're packed.
 
     With ``inner_folds`` 0, the cells are SpeechBrain-MOABB's (fold, seed) runs; with k,
-    each outer fold's training trials (theirs and their validation set's) are split k ways,
+    each outer fold's training trials (theirs and their validation set's) are split k ways
+    (``subjects``: one validation fold per training subject, for cross-subject decoding),
     and with ``seed_per_inner_fold`` each inner fold gets its own seed (so k folds and one
     seed per trial average over k seeds, at no extra cost).
     In the final evaluation with ``final_train: all``, a cell trains on all of them and has
@@ -228,6 +238,8 @@ def make_cells(data, seeds, settings, final=False):
         for name, train, valid, test in data["folds"]:
             if final and settings["final_train"] == "all":
                 splits = [(np.union1d(train, valid), None)]
+            elif settings["inner_folds"] == "subjects" and not final:
+                splits = protocol.inner_subject_folds(np.union1d(train, valid), data["subjects"])
             elif settings["inner_folds"] and not final:
                 splits = protocol.inner_folds(np.union1d(train, valid), data["y_np"], data["sessions"], data["runs"],
                                               settings["inner_folds"], settings["group_by_run"])
@@ -604,7 +616,10 @@ def apply_paradigm(cfg, settings, recordings):
 
 
 def held_out_sessions(recordings, settings):
-    """The test sessions of leave-one-session-out (pseudo-sessions for one-session subjects with ``outer_folds: rule``)."""
+    """The test sessions of leave-one-session-out (pseudo-sessions for one-session subjects with ``outer_folds: rule``),
+    or with ``outer_folds: subject_groups`` the test groups of subjects."""
+    if settings["outer_folds"] == "subject_groups":
+        return [name for name, _ in protocol.subject_groups(recordings.subjects, settings["outer_groups"])]
     if settings["outer_folds"] == "rule":
         return protocol.outer_session_names(recordings.structure())
     return sorted({session for by_session in recordings.raws.values() for session in by_session})
@@ -687,7 +702,8 @@ def main():
     parser.add_argument("--rerun-top", type=int, default=10, help="with --rerun: how many of the best trials")
     parser.add_argument("--rerun-seeds", type=int, default=5, help="with --rerun: seeds per trial")
     parser.add_argument("--test-session",
-                        help="only the folds that test on this session: one part of a search nested by test session")
+                        help="only the folds that test on this session (or group of subjects, e.g. sub01-02-03): "
+                             "one part of a search nested by test session")
     args = parser.parse_args()
     cfg = load_hparams(args.hparams, args.set)
     steps = steps_of(cfg)

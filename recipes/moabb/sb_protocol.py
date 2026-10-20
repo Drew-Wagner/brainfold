@@ -304,6 +304,29 @@ def leave_one_session_out(y, subjects, sessions, valid_ratio):
     return folds
 
 
+def subject_groups(subjects, n_groups):
+    """The test groups of cross-subject decoding: the sorted subjects in ``n_groups`` consecutive groups
+    (as np.array_split), each named by its subjects, e.g. sub01-02-03."""
+    groups = np.array_split(np.array(sorted(set(np.asarray(subjects).tolist()))), n_groups)
+    return [("sub" + "-".join(f"{s:02d}" for s in group), group) for group in groups]
+
+
+def leave_subject_group_out(subjects, n_groups):
+    """(name, train, valid, test) per group of ``subject_groups``: test on every trial of the group's
+    subjects, train on every trial of the others'; valid is empty (the inner folds split train)."""
+    folds = []
+    for name, group in subject_groups(subjects, n_groups):
+        test = np.flatnonzero(np.isin(subjects, group))
+        folds.append((f"subjects_test-{name}", np.flatnonzero(~np.isin(subjects, group)), np.array([], dtype=int), test))
+    return folds
+
+
+def inner_subject_folds(pool, subjects):
+    """Leave one subject out of the training trials ``pool``: one (train, valid) split per subject in it."""
+    pool = np.sort(pool)
+    return [(pool[subjects[pool] != s], pool[subjects[pool] == s]) for s in np.unique(subjects[pool])]
+
+
 def inner_folds(pool, y, sessions, runs, k, by_run, max_folds=6, min_runs=3, n_blocks=5):
     """k (train, valid) splits of the training trials ``pool``, each trial validated once.
 
