@@ -6,7 +6,9 @@
 # Resumable: resubmit the same array index with the same RESULTS_ID to continue an
 # interrupted search (the trial that was running is redone), e.g.
 #   sbatch ... --array=1 --export=ALL,RESULTS_ID=<first job id> cluster/drac/sb_protocol.sbatch
-# Extra arguments go to sb_search.py.
+# Extra arguments go to sb_search.py. SB_CONFIG picks another hparams file under
+# hparams/sb_moabb/, e.g. their protocol with the window and band out of the cue period:
+#   sbatch ... --array=0-1 --export=ALL,SB_CONFIG=nocue/bnci2014001_eegnet cluster/drac/sb_protocol.sbatch
 # Time, from the RTX 4080 SUPER (the 2g.20gb slice took 0.8-1.5x its time on the
 # recipes): step-1 trials took 11-98 s plus 12 s of preprocessing, so step 1 takes
 # about 1-2 h; step-2 trials train step 1's best model with augmentation, up to
@@ -23,6 +25,8 @@
 set -euo pipefail
 source "$SLURM_SUBMIT_DIR/cluster/drac/env.sh"
 source "$BRAINFOLD_VENV/bin/activate"
+# fail fast on a node whose GPU torch can't reach (job 65792547_0 ran 18 h on the CPU on fc10715)
+python -c "import torch; assert torch.cuda.is_available(), 'no GPU visible to torch on $(hostname)'"
 config=${SB_CONFIG:-bnci2014001_eegnet}
 optimizers=(adam schedule-free)
 optimizer=${optimizers[$SLURM_ARRAY_TASK_ID]}
