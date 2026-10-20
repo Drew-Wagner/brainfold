@@ -181,6 +181,8 @@ def prepare(hp, recordings, cfg, args, settings=PROTOCOL):
 
     ``hp["drop_rows"]``, a list of 10-20 rows (e.g. Fp, AF, F), drops those channels, and
     ``hp["modality"] = "eog"`` uses the EOG channels instead of the EEG (both for the audit).
+    ``hp["align"]`` ("none", "euclidean" or "riemannian") whitens each (subject, session) by
+    its first run's mean covariance before standardizing (sb_protocol.align).
     """
     sample_rate = hp.get("sample_rate", cfg["sample_rate"])
     modality = hp.get("modality", "eeg")
@@ -212,9 +214,12 @@ def prepare(hp, recordings, cfg, args, settings=PROTOCOL):
         folds = protocol.leave_one_session_out(y, subjects, sessions, cfg["valid_ratio"])
     if getattr(args, "test_session", None) is not None:  # a search nested by test session (or group): its folds only
         folds = testing_on(folds, args.test_session)
-    X = torch.from_numpy(X).to(args.device)
+    domain = protocol.domains(subjects, sessions)
+    reference = protocol.reference_trials(domain, runs)
+    X = torch.from_numpy(protocol.align(X, domain, reference, hp.get("align", "none"))).to(args.device)
     return dict(X=X, Xn=protocol.standardize(X), y=torch.from_numpy(y).to(args.device), folds=folds,
-                sessions=sessions, runs=runs, subjects=subjects, y_np=y, sample_rate=sample_rate, channels=[names[i] for i in keep])
+                sessions=sessions, runs=runs, subjects=subjects, y_np=y, sample_rate=sample_rate, channels=[names[i] for i in keep],
+                domain=domain, reference=reference)
 
 
 def testing_on(folds, session):
@@ -292,6 +297,8 @@ def train_cells(cells, hp, data, cfg, args, label, eval_epochs):
     device, X, Xn, y = args.device, data["X"], data["Xn"], data["y"]
     aug, eeg_aug = augmentation(hp, hp.get("augment", "none"), data["sample_rate"])
     kwargs = protocol.eegnet_kwargs(hp, X.shape[1], cfg["n_classes"], X.shape[2], data["sample_rate"])
+    # bn_stats "domain": each validation and test domain evaluated with its own BatchNorm statistics
+    adapt = (data["domain"], data["reference"]) if hp.get("bn_stats", "train") == "domain" else ()
     rows, curves, losses, timing = [], [], [], dict(train_seconds=0.0, oom_seconds=0.0, peak_allocated=0, n_packs=0)
     epoch_seconds = []  # each epoch's training time, summed over packs
 
@@ -308,8 +315,8 @@ def train_cells(cells, hp, data, cfg, args, label, eval_epochs):
         evaluated = {}
 
         def on_eval(epoch, model):
-            valid = protocol.scores(model, Xn, y, valid_idx) if valid_idx is not None else [{}] * len(pack)
-            evaluated[epoch] = (valid, protocol.scores(model, Xn, y, test_idx))
+            valid = protocol.scores(model, Xn, y, valid_idx, *adapt) if valid_idx is not None else [{}] * len(pack)
+            evaluated[epoch] = (valid, protocol.scores(model, Xn, y, test_idx, *adapt))
 
         if args.compile:
             torch._dynamo.reset()

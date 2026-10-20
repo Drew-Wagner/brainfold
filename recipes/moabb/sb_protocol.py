@@ -369,6 +369,74 @@ def standardize(x, eps=1e-6):
     return (x - x.mean(-1, keepdim=True)) / (x.std(-1, keepdim=True) + eps)
 
 
+# ---- alignment across subjects and sessions ----------------------------------------------------------
+
+def domains(subjects, sessions):
+    """Each trial's domain, one per (subject, session): the unit that's aligned, as an int array."""
+    keys = [f"{a}|{b}" for a, b in zip(subjects, sessions)]
+    return np.unique(keys, return_inverse=True)[1]
+
+
+def reference_trials(domain, runs):
+    """Each domain's reference trials: its first run (in recording order), unlabelled.
+
+    Alignment and per-domain BatchNorm statistics are estimated from these only, as a
+    calibration run before use would be, so they never see the rest of a test session.
+    """
+    reference = {}
+    for d in np.unique(domain):
+        of_domain = np.flatnonzero(domain == d)
+        reference[int(d)] = of_domain[runs[of_domain] == runs[of_domain[0]]]
+    return reference
+
+
+def _powm(c, p):
+    w, v = np.linalg.eigh(c)
+    return (v * w**p) @ v.T
+
+
+def riemannian_mean(covs, tol=1e-8, max_iter=50):
+    """The affine-invariant (geometric) mean of SPD matrices (n, C, C), by fixed-point iteration."""
+    mean = covs.mean(0)
+    for _ in range(max_iter):
+        root, inv_root = _powm(mean, 0.5), _powm(mean, -0.5)
+        logs = []
+        for c in covs:
+            w, v = np.linalg.eigh(inv_root @ c @ inv_root)
+            logs.append((v * np.log(w)) @ v.T)
+        step = np.mean(logs, 0)
+        w, v = np.linalg.eigh(step)
+        mean = root @ ((v * np.exp(w)) @ v.T) @ root
+        if np.linalg.norm(step) < tol:
+            break
+    return mean
+
+
+def align(X, domain, reference, method):
+    """Trials (n, C, T) whitened per domain by its reference covariance's inverse square root.
+
+    ``method`` "euclidean" uses the arithmetic mean of the reference trials' covariances
+    (He and Wu, 2019), "riemannian" their geometric mean (Zanini et al., 2018); either way
+    each domain's reference trials then have a mean covariance of the identity.
+    """
+    if method in (None, "none"):
+        return X
+    out = np.empty_like(X)
+    for d, ref in reference.items():
+        x = X[ref].astype(np.float64)
+        x = x - x.mean(-1, keepdims=True)
+        covs = np.einsum("nct,ndt->ncd", x, x) / x.shape[-1]
+        if method == "euclidean":
+            mean = covs.mean(0)
+        elif method == "riemannian":
+            mean = riemannian_mean(covs)
+        else:
+            raise ValueError(f"unknown alignment {method!r}")
+        of_domain = domain == d
+        out[of_domain] = np.einsum("cd,ndt->nct", _powm(mean, -0.5), X[of_domain]).astype(X.dtype)
+    return out
+
+
 # ---- augmentation -----------------------------------------------------------------------------------
 
 def augment(x, max_num_segments, amp_delta, min_shift, max_shift, snr_low, snr_high):
@@ -857,8 +925,47 @@ METRICS = {
 }
 
 
-def scores(model, Xn, y, idx):
-    """{metric: value} for every member, on the trials ``idx`` (K, n)."""
-    pred = predict(model, Xn, idx, batch_size=256).argmax(-1).cpu().numpy()  # (n, K)
+def scores(model, Xn, y, idx, domain=None, reference=None):
+    """{metric: value} for every member, on the trials ``idx`` (K, n).
+
+    With ``domain`` (each trial's, as ``domains``) and ``reference`` (``reference_trials``),
+    each domain is predicted with BatchNorm statistics recomputed on its reference trials
+    (adaptive BatchNorm, Li et al., 2016), one domain at a time; the model's own statistics
+    are restored afterwards.
+    """
+    if domain is None:
+        pred = predict(model, Xn, idx, batch_size=256).argmax(-1).cpu().numpy()  # (n, K)
+    else:
+        pred = _domain_predictions(model, Xn, idx.cpu().numpy(), domain, reference)
     labels = y[idx.T].cpu().numpy()
     return [{m: float(f(labels[:, k], pred[:, k])) for m, f in METRICS.items()} for k in range(idx.shape[0])]
+
+
+def _domain_predictions(model, Xn, idx, domain, reference):
+    """(n, K) predicted classes, each trial's from its domain's BatchNorm statistics."""
+    of_trial = domain[idx]  # (K, n)
+    per_member = [np.unique(row) for row in of_trial]
+    n_ref = min(len(reference[int(d)]) for row in per_member for d in row)
+    buffers = [b.clone() for b in model.buffers()]
+    pred = np.empty(idx.T.shape, dtype=np.int64)
+    device = Xn.device
+    dtype = next(model.parameters()).dtype
+    for j in range(max(len(row) for row in per_member)):
+        chosen = [row[min(j, len(row) - 1)] for row in per_member]  # member k's j-th domain
+        ref = torch.from_numpy(np.stack([reference[int(d)][:n_ref] for d in chosen])).to(device)
+        with torch.no_grad():
+            recalibrate_batch_norms(model, lambda: iter([model(Xn[ref.T].to(dtype))]))
+        mask = (of_trial == np.array(chosen)[:, None])  # (K, n)
+        counts = mask.sum(1)
+        if (counts == counts[0]).all():  # predict only the domain's trials (every member has as many)
+            pos = np.stack([np.flatnonzero(row) for row in mask])
+            sub = torch.from_numpy(np.take_along_axis(idx, pos, 1)).to(device)
+            out = predict(model, Xn, sub, batch_size=256).argmax(-1).cpu().numpy()  # (n_d, K)
+            pred[pos.T, np.arange(len(pos))] = out
+        else:
+            out = predict(model, Xn, torch.from_numpy(idx).to(device), batch_size=256).argmax(-1).cpu().numpy()
+            pred[mask.T] = out[mask.T]
+    with torch.no_grad():
+        for b, saved in zip(model.buffers(), buffers):
+            b.copy_(saved)
+    return pred

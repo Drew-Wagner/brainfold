@@ -1,0 +1,145 @@
+# Version 2 cross-subject (../v2_xsub/bnci2014001_eegnet.yaml) with subject alignment as two
+# more step-1 hyperparameters, so the search picks the strategy on inner validation (leave one
+# training subject out, the same shift as the test) like any other hyperparameter.
+# A development variant on BNCI2014001, not the frozen protocol.
+# - align: none, Euclidean alignment (He and Wu, 2019) or Riemannian re-centring (Zanini et
+#   al., 2018): each (subject, session) whitened by the mean covariance of its first run,
+#   before the per-trial standardization.
+# - bn_stats: the training set's BatchNorm statistics, or each evaluated (subject, session)'s
+#   own, recomputed on its first run (adaptive BatchNorm, Li et al., 2016; Wimpff et al., 2023).
+# Both use only the first run of a session, unlabelled, as a calibration run would be.
+# Everything else is v2_xsub's (its header explains the splits and the epoch range).
+
+# ---- the dataset (per dataset) ----
+dataset: BNCI2014_001
+n_classes: 4
+sample_rate: 125  # Hz: SpeechBrain-MOABB's, over 4x the band's upper edge; lowered to the recording's if that's lower
+valid_ratio: 0.2  # unused (inner folds)
+
+# ---- the paradigm (per dataset; PROTOCOL.md, "Inputs from each dataset") ----
+# Times in seconds from MOABB's epoch start. sb_search.py and sb_audit.py check the counts
+# and the rate against MOABB's metadata, and stop if they differ (null: not checked).
+paradigm:
+  cue_onset: 0.0  # MOABB's interval is 2-6 s of the trial; the arrow appears at 2 s (Tangermann et al., 2012)
+  cue_offset: 1.25  # the arrow shows for 1.25 s; "persists" if the cue stays on through the imagery
+  imagery_end: 4.0  # the fixation cross disappears at 6 s of the trial
+  sessions: 2  # per subject: outer folds
+  runs_per_session: 6  # inner folds
+  recording_rate: 250  # Hz
+  hardware_band: [0.5, 100]  # Hz, the amplifier's band-pass (and a 50 Hz notch); the protocol's band must be within it
+  montage: standard_1020
+  eeg_channels: 22
+  eog_channels: 3  # dropped
+
+# ---- the search, as version 1 (SpeechBrain-MOABB's TPE) ----
+metric: acc  # balanced accuracy
+seed: 1986  # TPE's and the base of the trials' seeds; --tpe-seed and --trial-seed for replicate searches
+final_seeds: 10
+trials: 50  # per step (theirs)
+startup_trials: 20  # theirs
+ei_candidates: 24  # theirs
+pack_size: 36  # cells per pack, as version 1 (packs that run out of memory split in two)
+
+protocol:
+  # Preprocessing by rule (PROTOCOL.md, "Preprocessing: fixed, not searched"): the window from
+  # 0.5 s after the cue's offset to the end of imagery (from the paradigm block), every EEG channel.
+  window: paradigm
+  channels: all
+  # Cross-subject splits: leave a group of subjects out, then one training subject out.
+  outer_folds: subject_groups
+  outer_groups: 3
+  inner_folds: subjects
+  # As version 1: a seed per inner fold, different in every trial; the one-SE rule;
+  # selection nested by test group; the final evaluation on all the training data.
+  seeds_per_trial: 1
+  seed_per_inner_fold: true
+  trial_seeds: per_trial
+  selection: one_se
+  se: paired  # new in version 2: the standard error of each trial's difference from the best, paired by inner fold
+  size: params
+  multi_objective: false
+  nested_by_test_session: true  # here: one search per test group of subjects
+  final_train: all
+  final_augment: eeg
+
+# Values a step doesn't search. The model and training are version 1's reference (step 0's),
+# which the audit trains and step 1 starts from.
+fixed:
+  # the band, by rule (PROTOCOL.md): motor imagery's mu and beta rhythms, 8-30 Hz (Blankertz et
+  # al., 2008), from 4 Hz, where eye movements have most of their power below (Schirrmeister et
+  # al., 2017), to 30 Hz, above which it's mostly muscle (Goncharova et al., 2003); tmin and tmax
+  # are set from the paradigm block
+  fmin: 4.0
+  fmax: 30.0
+  # training (Adam only: with schedule-free these aren't used): the middle of their priors
+  number_of_epochs: 52  # 625 / 12
+  avg_models: 8
+  bn_momentum: 0.1  # PyTorch's default
+  lr: 0.001  # Adam's default (Kingma and Ba, 2015)
+  batch_size_exponent: 5  # 32, the middle of their prior (16-64)
+  # EEGNet: Lawhern et al. (2018)'s EEGNet-8,2, temporal sizes in seconds (0.5 s kernels:
+  # 64 samples at their 128 Hz; second pooling 8 samples at 32 Hz)
+  cnn_temporal_kernels: 8
+  cnn_spatial_depth_multiplier: 2
+  cnn_septemporal_point_kernels_ratio_: 4  # F2 = ceil(4/4 * 8 * 2 + 1) = 17, their parametrization's nearest to 16
+  cnn_temporal_kernel_s: 0.5
+  cnn_septemporal_kernel_s: 0.5
+  cnn_septemporal_pool_s: 0.25
+  cnn_spatial_pool: 4
+  max_cnn_spatial_pool: 4
+  cnn_spatial_max_norm: 1.0  # EEGNet's
+  dense_max_norm: 0.25  # EEGNet's
+  dropout: 0.5  # Lawhern et al.'s for within-subject decoding
+  # alignment: off in the reference, as v2_xsub
+  align: none
+  bn_stats: train
+
+steps:
+  # Step 1: the architecture and training, SpeechBrain-MOABB's step-1 priors (temporal sizes
+  # in seconds at their 125 Hz: 24-62 samples, 3-24 and 1-8 samples after pooling by 4).
+  step1:
+    augment: none
+    epochs: grid
+    search:
+      lr: choices([0.01, 0.005, 0.001, 0.0005, 0.0001])
+      batch_size_exponent: uniform(4, 6, discrete=True)
+      number_of_epochs: uniform(20, 85, discrete=True)  # Adam only; 250-1000 / 12
+      avg_models: uniform(1, 15, discrete=True)  # Adam only
+      bn_momentum: loguniform(0.001, 1.0)  # Adam only
+      cnn_temporal_kernels: uniform(4, 64, discrete=True)
+      cnn_temporal_kernel_s: uniform(0.19, 0.5, precision=2)
+      cnn_spatial_depth_multiplier: uniform(1, 4, discrete=True)
+      cnn_septemporal_point_kernels_ratio_: uniform(0, 8, discrete=True)
+      cnn_septemporal_kernel_s: uniform(0.096, 0.77, precision=2)
+      cnn_septemporal_pool_s: uniform(0.032, 0.256, precision=2)
+      dropout: uniform(0.0, 0.5)
+      align: choices(["none", "euclidean", "riemannian"])
+      bn_stats: choices(["train", "domain"])
+  # Step 2: Rommel et al. (2022)'s EEG transforms, each on (probability 0.5) or off, as
+  # version 1 (the reasons are in hparams/sb_moabb/improved/bnci2014001_eegnet.yaml). New in
+  # version 2: the first trial has every transform off, and the one-SE rule counts the
+  # transforms on, so no augmentation is kept unless augmentation beats it by more than one
+  # standard error.
+  step2:
+    augment: eeg  # trains to step 1's chosen epoch
+    first_trial: all_off
+    size: n_transforms
+    search:
+      aug_time_reverse_p: choices([0.0, 0.5])
+      aug_sign_flip_p: choices([0.0, 0.5])
+      aug_ft_surrogate_p: choices([0.0, 0.5])
+      aug_ft_surrogate_phase: uniform(0.0, 1.0)  # phase noise up to this x 2 pi
+      aug_frequency_shift_p: choices([0.0, 0.5])
+      aug_frequency_shift_hz: uniform(0.0, 3.0)
+      aug_bandstop_p: choices([0.0, 0.5])
+      aug_bandstop_hz: uniform(0.0, 2.0)
+      aug_time_mask_p: choices([0.0, 0.5])
+      aug_time_mask_s: uniform(0.0, 2.0)
+      aug_channels_dropout_p: choices([0.0, 0.5])
+      aug_channels_dropout_drop: uniform(0.0, 1.0)
+
+# Schedule-free: the epoch is chosen on validation, every 5 epochs from 20 to 85 (version 2's
+# 250-1000 every 25, in optimizer steps), with BatchNorm statistics recomputed before each evaluation.
+schedule_free:
+  not_searched: [number_of_epochs, avg_models, bn_momentum]
+  epochs: {first: 20, last: 85, every: 5}
