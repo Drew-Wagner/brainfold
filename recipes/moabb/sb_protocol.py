@@ -149,6 +149,31 @@ def leave_one_session_out(y, subjects, sessions, valid_ratio):
     return folds
 
 
+def nested_folds(subjects, sessions, held_out, n_inner):
+    """Per subject, the outer fold testing on its ``held_out``-th session, with inner folds over the others.
+
+    Returns (name, train, test, inner) per subject, inner being (train, valid) pairs:
+    each training session is cut into ``n_inner`` contiguous blocks in time (whole
+    runs when they divide evenly, as BNCI2014001's 6 runs into 3), and inner fold j
+    validates on block j of every training session. The outer test session is in
+    none of them.
+    """
+    folds = []
+    for subject in sorted(set(subjects.tolist())):
+        names = np.unique(sessions[subjects == subject])
+        test_session = names[held_out]
+        blocks = [np.array_split(np.flatnonzero((subjects == subject) & (sessions == session)), n_inner)
+                  for session in names[names != test_session]]
+        train = np.sort(np.concatenate([b for session in blocks for b in session]))
+        inner = []
+        for j in range(n_inner):
+            valid = np.concatenate([session[j] for session in blocks])
+            inner.append((np.setdiff1d(train, valid), valid))
+        test = np.flatnonzero((subjects == subject) & (sessions == test_session))
+        folds.append((f"sub{subject:02d}_test-{test_session}", train, test, inner))
+    return folds
+
+
 def standardize(x, eps=1e-6):
     """SpeechBrain's mean_std_norm over time (the last dim), per trial and channel."""
     return (x - x.mean(-1, keepdim=True)) / (x.std(-1, keepdim=True) + eps)

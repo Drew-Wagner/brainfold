@@ -220,3 +220,50 @@ def test_pack_equals_members(optimizer, avg_models):
         for epoch in (2, 4):  # the evaluations train_idx[:1] of the pack-of-one see member 0's trials
             if k == 0:
                 torch.testing.assert_close(seen["packed"][epoch][:, :1], seen[k][epoch])
+
+
+# ---- nested_search.py ---------------------------------------------------------------------------
+
+def test_nested_folds_never_see_the_held_out_session():
+    subjects = np.repeat([1, 2], 2 * 288)
+    sessions = np.tile(np.repeat(["0train", "1test"], 288), 2)
+    for held_out in (0, 1):
+        folds = protocol.nested_folds(subjects, sessions, held_out, 3)
+        for (name, train, test, inner), subject in zip(folds, (1, 2)):
+            test_session = ["0train", "1test"][held_out]
+            assert name == f"sub{subject:02d}_test-{test_session}"
+            assert (sessions[test] == test_session).all() and (subjects[test] == subject).all() and len(test) == 288
+            assert (sessions[train] != test_session).all() and len(train) == 288
+            valids = [valid for _, valid in inner]
+            assert sorted(np.concatenate(valids)) == sorted(train)  # every training trial validated once
+            for j, (inner_train, valid) in enumerate(inner):
+                assert len(np.intersect1d(inner_train, valid)) == 0 and len(np.union1d(inner_train, valid)) == 288
+                # two whole runs of 48 trials, in time order
+                np.testing.assert_array_equal(valid, train[96 * j : 96 * (j + 1)])
+
+
+def test_select_simplest_within_one_standard_error():
+    nested_search = pytest.importorskip("nested_search")
+    per_subject = np.array([[0.80, 0.70, 0.60, 0.90],   # the best
+                            [0.79, 0.70, 0.59, 0.89],   # 0.0075 below, consistently: se 0.0025, outside
+                            [0.82, 0.66, 0.62, 0.88],   # 0.005 below, noisily: se 0.009, within
+                            [0.50, 0.50, 0.50, 0.50]])
+    sizes = [100, 10, 50, 1]
+    chosen, table = nested_search.select(per_subject, sizes)
+    assert [row["within"] for row in table] == [True, False, True, False]
+    assert chosen == 2 and table[0]["best"] and table[2]["chosen"]
+    assert nested_search.select(per_subject, None)[0] == 0
+    # the standard deviation over subjects is lenient: at 2 sd even the trial 0.25 below is within (0.26)
+    assert nested_search.select(per_subject, sizes, width=2, spread="sd")[0] == 3
+
+
+def test_sign_flip_p_is_exact():
+    nested_search = pytest.importorskip("nested_search")
+    assert nested_search.sign_flip_p(np.ones(5)) == 1 / 32  # only the observed signs reach the mean
+    assert nested_search.sign_flip_p(np.array([1.0, -1.0])) == 0.75  # means 0, -1, 1, 0 against 0
+
+
+def test_chance_level():
+    nested_search = pytest.importorskip("nested_search")
+    assert 0.29 < nested_search.chance_level(288, 4, 0.05) < 0.30  # BNCI2014001's test session
+    assert nested_search.chance_level(24, 2, 0.05) > 0.66  # Combrisson and Jerbi's small samples

@@ -40,7 +40,7 @@ import yaml
 
 import sb_protocol as protocol
 from tracking import environment, finish_run, start_run, write_csv, write_environment
-from train import load_hparams, packs, peak_memory
+from train import load_hparams, peak_memory
 
 
 # ---- search spaces in Orion's syntax ----------------------------------------------------------------
@@ -79,15 +79,10 @@ def suggest(trial, space):
 
 # ---- one trial: every fold, packed -----------------------------------------------------------------
 
-def run_trial(hp, seeds, recordings, cfg, args, label):
-    """Train every (seed, fold) with hyperparameters ``hp``; scores at each evaluated epoch.
-
-    Returns rows (one per seed and fold, final scores), curve rows (every evaluated
-    epoch), the members' training losses (epochs, n_runs) and timings.
-    """
+def prepare(hp, recordings, cfg, args):
+    """The trials for hyperparameters ``hp`` on the device, and what training on them needs."""
     hp = dict(hp, batch_size=2 ** hp["batch_size_exponent"])
-    sf = args.optimizer == "schedule-free"
-    if sf:
+    if args.optimizer == "schedule-free":
         epochs = cfg["schedule_free"]["epochs"]
         eval_epochs = list(range(epochs["first"], epochs["last"] + 1, epochs["every"]))
         if "chosen_epochs" in hp:  # the final evaluation: train to the chosen epoch only
@@ -101,41 +96,50 @@ def run_trial(hp, seeds, recordings, cfg, args, label):
     X, y, subjects, sessions = recordings.trials(hp["fmin"], hp["fmax"])
     X = protocol.crop(X, cfg["sample_rate"], recordings.interval(), hp["tmin"], hp["tmax"])
     X = X[:, recordings.channels(hp["n_steps_channel_selection"])]
-    folds = protocol.leave_one_session_out(y, subjects, sessions, cfg["valid_ratio"])
-    device = args.device
-    X = torch.from_numpy(X).to(device)
-    Xn = protocol.standardize(X)
-    y = torch.from_numpy(y).to(device)
-    data_seconds = time.perf_counter() - t0
+    X = torch.from_numpy(X).to(args.device)
+    data = dict(hp=hp, labels=y, subjects=subjects, sessions=sessions, X=X, Xn=protocol.standardize(X),
+                y=torch.from_numpy(y).to(args.device), eval_epochs=eval_epochs)
+    data["data_seconds"] = time.perf_counter() - t0
 
-    aug = None
+    data["aug"] = None
     if hp.get("augment", False):
         shift = 1e-2 * hp["shift_delta_"]
-        aug = dict(max_num_segments=hp["max_num_segments"], amp_delta=hp["amp_delta"],
-                   min_shift=math.floor(-cfg["sample_rate"] * shift), max_shift=math.floor(cfg["sample_rate"] * shift),
-                   snr_low=hp["snr_white_low"], snr_high=hp["snr_white_low"] + hp["snr_white_delta"])
-    kwargs = protocol.eegnet_kwargs(hp, X.shape[1], cfg["n_classes"], X.shape[2])
-    runs = [(name, seed, torch.from_numpy(train), torch.from_numpy(test), torch.from_numpy(valid))
-            for seed in seeds for name, train, valid, test in folds]
+        data["aug"] = dict(max_num_segments=hp["max_num_segments"], amp_delta=hp["amp_delta"],
+                           min_shift=math.floor(-cfg["sample_rate"] * shift),
+                           max_shift=math.floor(cfg["sample_rate"] * shift),
+                           snr_low=hp["snr_white_low"], snr_high=hp["snr_white_low"] + hp["snr_white_delta"])
+    data["kwargs"] = protocol.eegnet_kwargs(hp, X.shape[1], cfg["n_classes"], X.shape[2])
+    return data
+
+
+def train_runs(data, runs, pack_size, args, label):
+    """Train every run (name, seed, train indices, {set: indices}), packed; scores at each evaluated epoch.
+
+    Returns rows (one per run), curve rows (every evaluated epoch, ``<set>_<metric>``),
+    the members' training losses (epochs, n_runs) and timings.
+    """
+    hp, X, Xn, y, device = data["hp"], data["X"], data["Xn"], data["y"], args.device
     rows, curves, losses, timing = [], [], [], dict(train_seconds=0.0, peak_allocated=0)
 
     def train_pack(pack):
         """Train one pack and record its scores; a pack that runs out of memory is split in two."""
         pack_seeds = [r[1] for r in pack]
-        train_idx, test_idx, valid_idx = (torch.stack([r[i] for r in pack]).to(device) for i in (2, 3, 4))
+        train_idx = torch.stack([torch.from_numpy(r[2]) for r in pack]).to(device)
+        sets = {s: torch.stack([torch.from_numpy(r[3][s]) for r in pack]).to(device) for s in pack[0][3]}
         evaluated = {}
 
         def on_eval(epoch, model):
-            evaluated[epoch] = (protocol.scores(model, Xn, y, valid_idx), protocol.scores(model, Xn, y, test_idx))
+            evaluated[epoch] = {s: protocol.scores(model, Xn, y, idx) for s, idx in sets.items()}
 
         if args.compile:
             torch._dynamo.reset()
         peak_memory(device)
         t = time.perf_counter()
         try:
-            model = protocol.build(kwargs, pack_seeds, device)
+            model = protocol.build(data["kwargs"], pack_seeds, device)
             _, member_losses = protocol.fit(model, X, Xn, y, train_idx, pack_seeds, hp, optimizer=args.optimizer,
-                                            aug=aug, eval_epochs=eval_epochs, on_eval=on_eval, compile=args.compile)
+                                            aug=data["aug"], eval_epochs=data["eval_epochs"], on_eval=on_eval,
+                                            compile=args.compile)
         except torch.OutOfMemoryError:
             if len(pack) == 1:
                 raise
@@ -148,32 +152,44 @@ def run_trial(hp, seeds, recordings, cfg, args, label):
         timing["peak_allocated"] = max(timing["peak_allocated"], peak_memory(device)[0] or 0)
         losses.append(member_losses)
         for k, (name, seed, *_) in enumerate(pack):
-            for epoch, (valid, test) in sorted(evaluated.items()):
+            for epoch, by_set in sorted(evaluated.items()):
                 curves.append(dict(label=label, seed=seed, fold=name, epoch=epoch,
-                                   **{f"valid_{m}": v for m, v in valid[k].items()},
-                                   **{f"test_{m}": v for m, v in test[k].items()}))
+                                   **{f"{s}_{m}": v for s, scored in by_set.items() for m, v in scored[k].items()}))
             rows.append(dict(label=label, seed=seed, fold=name, n_train=train_idx.shape[1],
-                             n_valid=valid_idx.shape[1], n_test=test_idx.shape[1]))
+                             **{f"n_{s}": idx.shape[1] for s, idx in sets.items()}))
 
-    # packs() groups runs by training- and test-set size; split those groups by validation size too
-    for pack in packs(runs, cfg["pack_size"]):
-        for n_valid in dict.fromkeys(len(r[4]) for r in pack):
-            train_pack([r for r in pack if len(r[4]) == n_valid])
-    losses = torch.cat(losses, 1)
+    # a pack's members share their training- and evaluation-set sizes
+    groups = {}
+    for run in runs:
+        groups.setdefault((len(run[2]), *(len(idx) for idx in run[3].values())), []).append(run)
+    for group in groups.values():
+        for start in range(0, len(group), pack_size):
+            train_pack(group[start : start + pack_size])
+    return dict(rows=rows, curves=curves, losses=torch.cat(losses, 1), **timing)
 
-    # the epoch to report: the last (Adam), or the best mean validation score (schedule-free)
-    metric = cfg["metric"]
+
+def choose_epoch(result, metric, schedule_free, hp):
+    """The epoch to report, the last (Adam) or the best mean validation score (schedule-free), into the rows."""
     by_epoch = {}
-    for c in curves:
+    for c in result["curves"]:
         by_epoch.setdefault(c["epoch"], []).append(c[f"valid_{metric}"])
     mean_valid = {epoch: float(np.mean(v)) for epoch, v in by_epoch.items()}
-    chosen = max(mean_valid, key=lambda e: (mean_valid[e], -e)) if sf else hp["number_of_epochs"]
-    final = {(c["seed"], c["fold"]): c for c in curves if c["epoch"] == chosen}
-    for row in rows:
+    chosen = max(mean_valid, key=lambda e: (mean_valid[e], -e)) if schedule_free else hp["number_of_epochs"]
+    final = {(c["seed"], c["fold"]): c for c in result["curves"] if c["epoch"] == chosen}
+    for row in result["rows"]:
         row.update({k: v for k, v in final[(row["seed"], row["fold"])].items() if k.startswith(("valid_", "test_"))},
                    epoch=chosen)
-    return dict(rows=rows, curves=curves, losses=losses, objective=mean_valid[chosen], epoch=chosen,
-                mean_valid=mean_valid, data_seconds=data_seconds, **timing)
+    return dict(result, objective=mean_valid[chosen], epoch=chosen, mean_valid=mean_valid)
+
+
+def run_trial(hp, seeds, recordings, cfg, args, label):
+    """Train every (seed, fold) with hyperparameters ``hp``: train_runs' results, at choose_epoch's epoch."""
+    data = prepare(hp, recordings, cfg, args)
+    folds = protocol.leave_one_session_out(data["labels"], data["subjects"], data["sessions"], cfg["valid_ratio"])
+    runs = [(name, seed, train, dict(valid=valid, test=test)) for seed in seeds for name, train, valid, test in folds]
+    result = train_runs(data, runs, cfg["pack_size"], args, label)
+    return dict(choose_epoch(result, cfg["metric"], args.optimizer == "schedule-free", data["hp"]),
+                data_seconds=data["data_seconds"])
 
 
 # ---- the protocol ----------------------------------------------------------------------------------

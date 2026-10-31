@@ -355,6 +355,31 @@ trials took 11-98 s, plus 12 s to preprocess.
     python sb_search.py hparams/sb_moabb/bnci2014001_eegnet.yaml --out results/sb/adam
     python sb_search.py hparams/sb_moabb/bnci2014001_eegnet.yaml --optimizer schedule-free --out results/sb/sf
 
+`nested_search.py` runs the same search with three changes, set in the
+hparams file's `nested` section:
+
+- **Nested.** Their search averages the validation score over every fold, so
+  the validation trials of session 0 (from the folds that test on session 1)
+  choose the hyperparameters that are then tested on session 0. Here each
+  held-out session gets its own search, which only sees the other sessions.
+  The final score measures the whole procedure, which may choose different
+  hyperparameters for each held-out session.
+- **Less noise per trial.** A trial is scored over 3 inner folds (contiguous
+  blocks of 2 of BNCI2014001's 6 runs, so every training trial is validated
+  once) and 2 seeds, which change from trial to trial.
+- **The simplest within one standard error.** Trials are compared to the best
+  paired by subject, the independent unit: for each subject, the best's score
+  minus the trial's, averaged over subjects. The trial with the fewest FLOPs
+  whose gap is at most one standard error of that mean is chosen (step 1; step
+  2 takes the best). `<step>-selection.csv` also gives every trial an exact
+  sign-flip permutation p-value against the best.
+
+The final test scores carry Combrisson and Jerbi's (2015) binomial chance
+level per fold. It treats the test trials as independent, so it is a lower
+bound on the true chance level.
+
+    python nested_search.py hparams/sb_moabb/bnci2014001_eegnet.yaml --out results/sb-nested/adam
+
 ### Results
 
 On an RTX 4080 SUPER, packed and with `--baseline`, seeds 0, 1 and 2 (seed 0

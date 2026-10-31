@@ -79,3 +79,17 @@ search:
 schedule_free:
   not_searched: [number_of_epochs, avg_models, bn_momentum]
   epochs: {first: 250, last: 1000, every: 25}
+
+# nested_search.py: their search, nested (one search per held-out session, seeing only
+# the others), each trial scored over inner folds and seeds, choosing for size.
+nested:
+  held_out: null  # session positions to hold out, one search each; null for every session
+  inner_folds: 3  # contiguous blocks per training session: 2 of BNCI2014001's 6 runs (96 trials) each
+  seeds: 2  # per trial, different for every trial
+  pack_size: 54  # 9 subjects x 3 inner folds x 2 seeds: one pack per trial
+  select:  # the simplest trial (flops or params) within `width` spreads of the best; null for the best
+    step1: flops
+    step2: null  # augmentation doesn't change the model's size
+  width: 1.0
+  spread: se  # se: standard error over subjects of the mean paired gap; sd: its standard deviation
+  alpha: 0.05  # binomial chance level of the final test scores (Combrisson and Jerbi, 2015)
