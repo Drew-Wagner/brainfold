@@ -1,0 +1,18 @@
+trial: 9
+valid: 0.7951388888888888
+gap: 0.0
+bound: 0.0
+params: 27872
+flops: 18748320
+epoch: 816
+n_within: 9
+best:
+  trial: 9
+  valid: 0.7951388888888888
+  params: 27872
+  flops: 18748320
+values:
+  max_num_segments: 2
+  amp_delta: 0.33431708806702604
+  snr_white_low: 13.0
+  snr_white_delta: 15.4
