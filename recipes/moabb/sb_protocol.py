@@ -52,6 +52,16 @@ mne.set_log_level("ERROR")
 
 # ---- data -------------------------------------------------------------------------------------------
 
+def load_dataset(name, kwargs=None):
+    """A MOABB dataset by class name (``BNCI2014_001``), or ours as ``module:Class`` (``bciciv1:BCICIV1``)."""
+    import importlib
+
+    import moabb.datasets
+
+    module, _, cls = name.rpartition(":")
+    return getattr(importlib.import_module(module) if module else moabb.datasets, cls)(**(kwargs or {}))
+
+
 class Recordings:
     """A MOABB dataset's raw recordings, kept in memory, preprocessed as MOABB's paradigm would.
 
@@ -60,10 +70,8 @@ class Recordings:
     reloading the files; its last few results are cached.
     """
 
-    def __init__(self, dataset, n_classes, sample_rate, subjects=None, threads=8):
-        import moabb.datasets
-
-        self.dataset = getattr(moabb.datasets, dataset)()
+    def __init__(self, dataset, n_classes, sample_rate, subjects=None, threads=8, dataset_kwargs=None):
+        self.dataset = load_dataset(dataset, dataset_kwargs)
         self.subjects = subjects or self.dataset.subject_list
         self.n_classes, self.sample_rate, self.threads = n_classes, sample_rate, threads
         self.raws = self.dataset.get_data(self.subjects)

@@ -93,3 +93,7 @@ nested:
   width: 1.0
   spread: se  # se: standard error over subjects of the mean paired gap; sd: its standard deviation
   alpha: 0.05  # binomial chance level of the final test scores (Combrisson and Jerbi, 2015)
+
+# final_null.py: the label-permutation null of the final models, labels shuffled within runs
+permutation_null:
+  runs_per_session: 6  # 6 runs of 48 trials

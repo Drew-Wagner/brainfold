@@ -279,7 +279,8 @@ def main():
     trials_dir.mkdir(parents=True, exist_ok=True)
 
     t0 = time.perf_counter()
-    recordings = protocol.Recordings(cfg["dataset"], cfg["n_classes"], cfg["sample_rate"], subjects=args.subjects)
+    recordings = protocol.Recordings(cfg["dataset"], cfg["n_classes"], cfg["sample_rate"], subjects=args.subjects,
+                                     dataset_kwargs=cfg.get("dataset_kwargs"))
     env = dict(environment(args.device), load_seconds=time.perf_counter() - t0, optimizer=args.optimizer)
     paths = [write_environment(args.out / "results", env)]
     run = start_run(args.wandb, "sb-protocol", args.hparams, cfg, args, env)
