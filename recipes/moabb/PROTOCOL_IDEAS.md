@@ -122,6 +122,25 @@ is what keeps that affordable.
 - The proposal doc's RQ1 (variance split into subject, subject x configuration,
   seed and validation noise) generalises this.
 
+### 8. Validate on spoken cues, and search the window's start (BCI Competition IV data set 1)
+
+Drew's idea (November 2026), for after the first search on data set 1 (job 2178119),
+which validates on the calibration session (visual cues), like the training data.
+
+- **Validate on the evaluation session (spoken cues),** so that the search chooses
+  configurations that carry over to a different cue. A visual response to the arrow
+  can't help there; motor imagery can.
+- **Make `tmin` free** (fixed at 0 in SpeechBrain-MOABB, and so far here), and see
+  whether the search moves the window away from the cue onset towards the imagery
+  itself: does it learn to "maximize" the motor imagery signal?
+- **To work out first:**
+  - Something must stay untouched for testing. Split the evaluation session's 4 runs:
+    validate on some, test on others, or nest over them.
+  - Search `tmin` with a duration (or `tmax > tmin`).
+  - The interval is 0-4 s, and evaluation trials shorter than 4 s of imagery are
+    dropped (`min_duration`). A later window needs a longer interval, and fewer
+    trials last long enough (imagery lasts 1.5-8 s).
+
 ## What makes this affordable now
 
 - SpeechBrain-MOABB reports about 8 h on a V100 for one full experiment

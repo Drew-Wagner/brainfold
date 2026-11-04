@@ -7,7 +7,7 @@
 # 80 min per task; the 2g.20gb slice took 0.8-1.5x the 4080's time on the recipes: up to about 2 h.
 #SBATCH --job-name=brainfold-cue-null
 #SBATCH --gpus=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=3  # billed as the max of CPUs, memory and GPU: 3 CPUs stay under a 2g.20gb slice (see CLAUDE.md)
 #SBATCH --mem=32G
 #SBATCH --time=3:00:00
 #SBATCH --output=%x-%A_%a.out

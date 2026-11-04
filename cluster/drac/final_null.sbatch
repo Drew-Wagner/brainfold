@@ -11,7 +11,7 @@
 # checks' null (job 2042573): about 1 h, and 2 h 30 min leaves room for a larger chosen model.
 #SBATCH --job-name=brainfold-final-null
 #SBATCH --gpus=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=3  # billed as the max of CPUs, memory and GPU: 3 CPUs stay under a 2g.20gb slice (see CLAUDE.md)
 #SBATCH --mem=32G
 #SBATCH --time=2:30:00
 #SBATCH --output=%x-%j.out

@@ -12,7 +12,7 @@
 # about 7 h. The 12 h request is 1.7x that; the search resumes if it doesn't finish.
 #SBATCH --job-name=brainfold-sb-nested
 #SBATCH --gpus=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=3  # billed as the max of CPUs, memory and GPU: 3 CPUs stay under a 2g.20gb slice (see CLAUDE.md)
 #SBATCH --mem=32G
 #SBATCH --time=12:00:00
 #SBATCH --output=%x-%A_%a.out
