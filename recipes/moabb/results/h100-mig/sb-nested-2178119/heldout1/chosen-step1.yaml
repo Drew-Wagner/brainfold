@@ -1,0 +1,30 @@
+trial: 48
+valid: 0.8325087635386159
+gap: 0.0
+bound: 0.0
+params: 5014
+flops: 63232608
+epoch: 861
+n_within: 1
+best:
+  trial: 48
+  valid: 0.8325087635386159
+  params: 5014
+  flops: 63232608
+values:
+  fmin: 1.9
+  fmax: 42.0
+  tmax: 3.8
+  n_steps_channel_selection: 2
+  avg_models: 4
+  number_of_epochs: 861
+  lr: 0.0005
+  batch_size_exponent: 5
+  bn_momentum: 0.009681533180747994
+  cnn_temporal_kernels: 44
+  cnn_temporal_kernelsize: 51
+  cnn_spatial_depth_multiplier: 1
+  cnn_septemporal_point_kernels_ratio_: 1
+  cnn_septemporal_kernelsize_: 7
+  cnn_septemporal_pool: 6
+  dropout: 0.4042840666070263
